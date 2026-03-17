@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from uuid import UUID
 
-from app.database import get_pool
+from app.storage import get_backend
 from app.utils.text import extract_lines, grep_with_context
 
 _SPREADSHEET_MIMES = {
@@ -30,130 +30,73 @@ class FileNotFoundError(Exception):
 async def resolve_filename(filename: str) -> UUID:
     """Resolve a filename to a file UUID.
 
-    Resolution order: exact → UUID → fuzzy (trigram) → unique substring.
+    Resolution order: exact → UUID → fuzzy → unique substring.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # 1. Exact match
-        row = await conn.fetchrow(
-            "SELECT id FROM files WHERE filename = $1 AND status = 'ready'",
-            filename,
+    backend = get_backend()
+
+    # 1. Exact match
+    fid = await backend.find_file_exact(filename)
+    if fid:
+        return UUID(fid)
+
+    # 2. UUID match
+    fid = await backend.find_file_by_uuid(filename)
+    if fid:
+        return UUID(fid)
+
+    # 3. Fuzzy match
+    rows = await backend.find_files_fuzzy(filename)
+    if len(rows) == 1:
+        return UUID(rows[0]["id"])
+    if len(rows) > 1:
+        if rows[0]["sim"] > rows[1]["sim"] + 0.2:
+            return UUID(rows[0]["id"])
+        raise AmbiguousFilenameError(
+            candidates=[{"id": r["id"], "filename": r["filename"]} for r in rows]
         )
-        if row:
-            return row["id"]
 
-        # 2. UUID match
-        try:
-            file_id = UUID(filename)
-            row = await conn.fetchrow(
-                "SELECT id FROM files WHERE id = $1 AND status = 'ready'",
-                file_id,
-            )
-            if row:
-                return row["id"]
-        except ValueError:
-            pass
-
-        # 3. Fuzzy match (trigram similarity)
-        rows = await conn.fetch(
-            "SELECT id, filename, similarity(filename, $1) AS sim "
-            "FROM files WHERE filename % $1 AND status = 'ready' "
-            "ORDER BY sim DESC LIMIT 5",
-            filename,
+    # 4. Unique substring match
+    rows = await backend.find_files_ilike(filename)
+    if len(rows) == 1:
+        return UUID(rows[0]["id"])
+    if len(rows) > 1:
+        raise AmbiguousFilenameError(
+            candidates=[{"id": r["id"], "filename": r["filename"]} for r in rows]
         )
-        if len(rows) == 1:
-            return rows[0]["id"]
-        if len(rows) > 1:
-            # If top match is significantly better, use it
-            if rows[0]["sim"] > rows[1]["sim"] + 0.2:
-                return rows[0]["id"]
-            raise AmbiguousFilenameError(
-                candidates=[
-                    {"id": str(r["id"]), "filename": r["filename"]} for r in rows
-                ]
-            )
 
-        # 4. Unique substring match
-        rows = await conn.fetch(
-            "SELECT id, filename FROM files "
-            "WHERE filename ILIKE $1 AND status = 'ready'",
-            f"%{filename}%",
-        )
-        if len(rows) == 1:
-            return rows[0]["id"]
-        if len(rows) > 1:
-            raise AmbiguousFilenameError(
-                candidates=[
-                    {"id": str(r["id"]), "filename": r["filename"]} for r in rows
-                ]
-            )
-
-        raise FileNotFoundError(f"No file matching '{filename}'")
+    raise FileNotFoundError(f"No file matching '{filename}'")
 
 
 async def get_file_text(file_id: UUID) -> dict:
     """Get the full text record for a file."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT full_text, total_lines, line_index, toc "
-            "FROM file_text WHERE file_id = $1",
-            file_id,
-        )
-        if not row:
-            raise FileNotFoundError(f"No text found for file {file_id}")
-        return dict(row)
+    return await get_backend().get_file_text(str(file_id))
 
 
 async def get_total_pages(file_id: UUID) -> int:
     """Get the total number of pages for a file."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        count = await conn.fetchval(
-            "SELECT COUNT(*) FROM pages WHERE file_id = $1", file_id
-        )
-        return count
+    return await get_backend().get_total_pages(str(file_id))
 
 
 async def get_page_line_ranges(
     file_id: UUID, page_numbers: list[int]
 ) -> list[tuple[int, int]]:
     """Get line ranges for specific pages."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT line_start, line_end FROM pages "
-            "WHERE file_id = $1 AND page_number = ANY($2) "
-            "ORDER BY page_number",
-            file_id,
-            page_numbers,
-        )
-        return [(r["line_start"], r["line_end"]) for r in rows]
+    return await get_backend().get_page_line_ranges(str(file_id), page_numbers)
 
 
 async def get_page_by_section_title(file_id: UUID, title: str) -> list[int]:
-    """Find page numbers by section title (for XLSX sheet names etc)."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT page_number FROM pages "
-            "WHERE file_id = $1 AND section_title ILIKE $2 "
-            "ORDER BY page_number",
-            file_id,
-            f"%{title}%",
-        )
-        return [r["page_number"] for r in rows]
+    """Find page numbers by section title."""
+    return await get_backend().get_page_by_section_title(str(file_id), title)
 
 
 def parse_page_spec(spec: str) -> list[int] | str:
     """Parse a page specification string.
 
-    Returns list of ints for numeric specs, or a string for named specs (sheet names).
+    Returns list of ints for numeric specs, or a string for named specs.
     Examples: "3" → [3], "3-7" → [3,4,5,6,7], "1,3,5" → [1,3,5], "Revenue" → "Revenue"
     """
     spec = spec.strip()
 
-    # Try numeric patterns
     if re.match(r"^\d+$", spec):
         return [int(spec)]
 
@@ -165,7 +108,6 @@ def parse_page_spec(spec: str) -> list[int] | str:
     if re.match(r"^\d+(,\d+)+$", spec):
         return [int(x) for x in spec.split(",")]
 
-    # Non-numeric: treat as section/sheet name
     return spec
 
 
@@ -187,10 +129,7 @@ async def read_file_text(
     grep: str | None = None,
     toc: bool = False,
 ) -> tuple[str, dict]:
-    """Read file text with optional filtering.
-
-    Returns (text, info_dict).
-    """
+    """Read file text with optional filtering. Returns (text, info_dict)."""
     text_row = await get_file_text(file_id)
     total_pages = await get_total_pages(file_id)
 
@@ -200,18 +139,15 @@ async def read_file_text(
         "total_lines": text_row["total_lines"],
     }
 
-    # Return TOC
     if toc:
         return text_row["toc"] or "", info
 
     text = text_row["full_text"]
     line_index = text_row["line_index"]
 
-    # Filter by pages
     if pages:
         page_spec = parse_page_spec(pages)
         if isinstance(page_spec, str):
-            # Named page (sheet name)
             page_nums = await get_page_by_section_title(file_id, page_spec)
         else:
             page_nums = page_spec
@@ -223,12 +159,10 @@ async def read_file_text(
                 parts.append(extract_lines(text, line_index, start, end))
             text = "\n\n".join(parts)
 
-    # Filter by lines
     if lines:
         start, end = parse_line_spec(lines)
         text = extract_lines(text, line_index, start, end)
 
-    # Grep
     if grep:
         text = grep_with_context(text, grep, context=2)
 
@@ -241,15 +175,7 @@ async def read_file_text(
 
 async def get_file_info(file_id: UUID) -> dict:
     """Get file_path, mime_type, and filename for a file."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT file_path, mime_type, filename FROM files WHERE id = $1",
-            file_id,
-        )
-        if not row:
-            raise FileNotFoundError(f"File {file_id} not found")
-        return dict(row)
+    return await get_backend().get_file_info(str(file_id))
 
 
 def _parse_structured(file_path_str: str, mime_type: str, sheet_filter: list[str] | None) -> dict:
@@ -268,47 +194,23 @@ async def read_structured_spreadsheet(
     file_id: UUID,
     pages: str | None = None,
 ) -> dict:
-    """Read a spreadsheet file and return structured JSON with columns/rows.
-
-    Raises ValueError if the file is not a spreadsheet.
-    """
+    """Read a spreadsheet file and return structured JSON with columns/rows."""
     info = await get_file_info(file_id)
     mime_type = info["mime_type"]
 
     if mime_type not in _SPREADSHEET_MIMES:
         raise ValueError(
-            f"format=json is only supported for spreadsheet files, "
-            f"got {mime_type}"
+            f"format=json is only supported for spreadsheet files, got {mime_type}"
         )
 
-    # Determine sheet filter from pages param
     sheet_filter: list[str] | None = None
     if pages:
         page_spec = parse_page_spec(pages)
         if isinstance(page_spec, str):
-            # Named sheet
             sheet_filter = [page_spec]
         else:
-            # Numeric pages — resolve to sheet names via section_titles
-            page_nums = page_spec
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT DISTINCT section_title FROM pages "
-                    "WHERE file_id = $1 AND page_number = ANY($2) "
-                    "AND section_title IS NOT NULL",
-                    file_id,
-                    page_nums,
-                )
-            if rows:
-                # Extract base sheet name (strip " - rows N-M" suffix)
-                names = set()
-                for r in rows:
-                    title = r["section_title"]
-                    # Strip row range suffix like " - rows 2-101"
-                    base = title.split(" - rows ")[0] if " - rows " in title else title
-                    names.add(base)
-                sheet_filter = list(names)
+            names = await get_backend().get_sheet_names_for_pages(str(file_id), page_spec)
+            sheet_filter = names if names else None
 
     return await asyncio.to_thread(
         _parse_structured, info["file_path"], mime_type, sheet_filter

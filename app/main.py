@@ -6,7 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.database import close_pool, init_pool
 from app.services.watch_service import stop_all as stop_all_watchers
 from app.routers.files import router as files_router
 from app.routers.glob import router as glob_router
@@ -16,6 +15,7 @@ from app.routers.read import router as read_router
 from app.routers.search import router as search_router
 from app.services.read_service import AmbiguousFilenameError
 from app.services.read_service import FileNotFoundError as FileDBNotFoundError
+from app.storage import init_backend, close_backend
 
 
 @asynccontextmanager
@@ -25,10 +25,25 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     settings.file_storage_path.mkdir(parents=True, exist_ok=True)
-    await init_pool()
+
+    if settings.backend == "sqlite":
+        db_path = settings.musedb_dir / "metadata.db"
+        settings.musedb_dir.mkdir(parents=True, exist_ok=True)
+        await init_backend("sqlite", db_path=db_path)
+    else:
+        # PostgreSQL: initialise pool first, then register backend
+        from app.database import init_pool
+        await init_pool()
+        await init_backend("postgres")
+
     yield
+
     stop_all_watchers()
-    await close_pool()
+    await close_backend()
+
+    if settings.backend == "postgres":
+        from app.database import close_pool
+        await close_pool()
 
 
 app = FastAPI(
@@ -46,7 +61,6 @@ app.add_middleware(
 )
 
 
-# Global exception handlers
 @app.exception_handler(FileDBNotFoundError)
 async def file_not_found_handler(request: Request, exc: FileDBNotFoundError):
     return JSONResponse(status_code=404, content={"error": "file_not_found", "detail": str(exc)})

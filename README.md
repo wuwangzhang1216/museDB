@@ -23,12 +23,35 @@ MuseDB turns any file — code, PDF, DOCX, PPTX, XLSX, CSV, images — into inst
 ## Install
 
 ```bash
-pip install musedb                # Core (REST API server)
+pip install musedb                # Core (REST API server, PostgreSQL)
+pip install musedb[cli]           # + CLI + embedded SQLite mode (zero-config)
 pip install musedb[mcp]           # + MCP server
 pip install musedb[integration]   # + Python library client
 ```
 
 ## Quick Start
+
+### Embedded mode (zero-config, no PostgreSQL needed)
+
+```bash
+pip install musedb[cli]
+musedb index ./my_workspace       # parse & index everything
+musedb serve-mcp                  # start MCP server over stdio
+```
+
+Or from Python:
+
+```python
+from musedb import MuseDB
+db = MuseDB.open("./my_workspace")
+await db.init()
+await db.index()
+text = await db.read("report.pdf", pages="1-3")
+results = await db.search("quarterly revenue")
+await db.close()
+```
+
+### Server mode (shared/team, PostgreSQL)
 
 ```bash
 git clone https://github.com/wuwangzhang1216/museDB.git
@@ -44,13 +67,33 @@ MuseDB ships with a built-in MCP (Model Context Protocol) server that exposes 3 
 
 ### Install & Run
 
+**Embedded mode** (zero-config, no PostgreSQL needed):
+
+```bash
+pip install musedb[cli]
+musedb index ./my_workspace       # index your files
+musedb serve-mcp                  # start MCP server (stdio)
+```
+
+Configure in your agent:
+
+```yaml
+mcp:
+  musedb:
+    transport: stdio
+    command: musedb
+    args: ["serve-mcp", "--workspace", "/path/to/workspace"]
+```
+
+**Server mode** (shared PostgreSQL backend):
+
 ```bash
 pip install -e ".[mcp]"
 python -m mcp_server              # stdio transport (default)
 python -m mcp_server --transport streamable_http --port 8200  # HTTP transport
 ```
 
-### Configure in your agent
+Configure in your agent:
 
 ```yaml
 mcp:
@@ -101,7 +144,26 @@ musedb_glob(pattern="src/**/*.{ts,tsx}", path="/workspace")
 
 ## Python Library
 
-MuseDB can be imported directly as a Python library — no HTTP server needed.
+MuseDB can be used as a Python library — no HTTP server needed.
+
+**Embedded mode** (SQLite, zero-config):
+
+```bash
+pip install musedb[cli]
+```
+
+```python
+from musedb import MuseDB
+
+db = MuseDB.open("./my_workspace")
+await db.init()
+await db.index()                              # index workspace root
+text = await db.read("report.pdf", pages="1-3")
+results = await db.search("quarterly revenue")
+await db.close()
+```
+
+**Server mode** (PostgreSQL):
 
 ```bash
 pip install musedb[integration]
@@ -110,7 +172,11 @@ pip install musedb[integration]
 ```python
 from musedb_integration import MuseDBClient, create_tools, ensure_indexed, index_file
 
-# Initialize (connects directly to PostgreSQL)
+# Embedded (SQLite, no PostgreSQL)
+db = MuseDBClient(workspace_path="./my_workspace")
+await db.init()
+
+# Or server mode (PostgreSQL)
 db = MuseDBClient("postgresql://musedb:musedb@localhost:5432/musedb")
 await db.init()
 
@@ -142,7 +208,8 @@ await db.close()
 from musedb_integration import MuseDBClient, create_tools
 from your_app.tool import ToolDefinition, ToolResult  # your base classes
 
-db = MuseDBClient("postgresql://musedb:musedb@localhost:5432/musedb")
+db = MuseDBClient(workspace_path="./my_workspace")  # embedded mode
+# or: db = MuseDBClient("postgresql://...")           # server mode
 await db.init()
 
 # Creates 3 tools (id="read", "grep", "glob") that replace built-in tools.
@@ -544,6 +611,7 @@ See [benchmark/REPORT.md](benchmark/REPORT.md) for full methodology.
 
 ## Key Features
 
+- **Dual-mode runtime** — Embedded (SQLite, zero-config, `pip install musedb[cli]`) or Server (PostgreSQL, shared team access); same API either way
 - **MCP Server** — 3 tools (`musedb_read`, `musedb_search`, `musedb_glob`) that replace an agent's built-in read/grep/glob
 - **Code file support** — Read code with line numbers (`?numbered=true`), auto-detected by MCP tools
 - **Regex grep** — `POST /search` with `mode=grep` for code search with regex, context lines, and file filtering
@@ -576,8 +644,10 @@ Environment variables with `FILEDB_` prefix:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FILEDB_DATABASE_URL` | `postgresql://musedb:musedb@localhost:5432/musedb` | PostgreSQL connection |
-| `FILEDB_FILE_STORAGE_PATH` | `./data` | File storage directory |
+| `FILEDB_BACKEND` | `postgres` | Storage backend: `postgres` or `sqlite` |
+| `FILEDB_MUSEDB_DIR` | `.musedb` | Embedded mode workspace directory |
+| `FILEDB_DATABASE_URL` | `postgresql://musedb:musedb@localhost:5432/musedb` | PostgreSQL connection (server mode) |
+| `FILEDB_FILE_STORAGE_PATH` | `./data` | File blob storage directory |
 | `FILEDB_MAX_FILE_SIZE` | `104857600` | Max upload size (100MB) |
 | `FILEDB_OCR_ENABLED` | `true` | Enable OCR for images |
 | `FILEDB_OCR_LANGUAGES` | `eng+chi_sim+chi_tra` | Tesseract languages |
@@ -593,13 +663,25 @@ MCP Server environment variables:
 
 ## Manual Setup
 
+**Embedded mode:**
+
+```bash
+pip install musedb[cli]
+musedb init ./workspace
+musedb index ./workspace
+musedb serve-mcp             # MCP over stdio
+musedb serve                 # HTTP API at http://127.0.0.1:8000
+```
+
+**Server mode (PostgreSQL):**
+
 ```bash
 pip install -e .
 createdb musedb && psql musedb < sql/schema.sql
 uvicorn app.main:app --reload
 ```
 
-Requires Python 3.11+, PostgreSQL 16+, Tesseract OCR (optional).
+Requires Python 3.11+. Server mode additionally requires PostgreSQL 16+. Tesseract OCR is optional (for image/scanned PDF support).
 
 ### MCP Server Setup
 

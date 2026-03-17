@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # Directory watching
     watch_max_watchers: int = 10
 
+    # Storage backend: "postgres" (default, requires PostgreSQL) or "sqlite" (embedded, zero-config)
+    backend: str = "postgres"
+
+    # SQLite embedded mode — path to the .musedb directory
+    musedb_dir: Path = Path(".musedb")
+
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
