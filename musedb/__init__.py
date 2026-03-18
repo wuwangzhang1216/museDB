@@ -16,6 +16,6 @@ Embedded usage::
     asyncio.run(main())
 """
 
-from app.workspace import Workspace as MuseDB
+from musedb_core.workspace import Workspace as MuseDB
 
 __all__ = ["MuseDB"]

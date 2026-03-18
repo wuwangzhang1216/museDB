@@ -82,7 +82,7 @@ class MuseDBClient:
 
     async def _init_embedded(self) -> None:
         try:
-            from app.workspace import Workspace
+            from musedb_core.workspace import Workspace
             self._workspace = Workspace.open(self._workspace_path)
             await self._workspace.init()
             self._initialized = True
@@ -94,9 +94,9 @@ class MuseDBClient:
 
     async def _init_postgres(self) -> None:
         try:
-            from app.database import init_pool
-            from app.config import settings
-            from app.storage import init_backend
+            from musedb_core.database import init_pool
+            from musedb_core.config import settings
+            from musedb_core.storage import init_backend
 
             settings.database_url = self._database_url
             settings.db_pool_min = self._pool_min
@@ -125,7 +125,7 @@ class MuseDBClient:
 
         if self._mode == "postgres":
             try:
-                from app.database import get_pool
+                from musedb_core.database import get_pool
                 pool = await get_pool()
                 await pool.fetchval("SELECT 1")
                 return True
@@ -152,15 +152,23 @@ class MuseDBClient:
         if not await self.is_available():
             return None
         try:
-            from app.services.read_service import (
+            from musedb_core.services.read_service import (
                 resolve_filename,
                 read_file_text,
                 read_structured_spreadsheet,
-                FileNotFoundError,
+                FileNotFoundError as MuseDBFileNotFound,
             )
-            from app.utils.text import format_with_line_numbers
+            from musedb_core.utils.text import format_with_line_numbers
 
-            file_id = await resolve_filename(filename)
+            try:
+                file_id = await resolve_filename(filename)
+            except MuseDBFileNotFound:
+                # File not indexed — fall back to direct filesystem read
+                logger.debug("File '%s' not indexed, trying filesystem", filename)
+                return await self._read_from_filesystem(
+                    filename, numbered=numbered, pages=pages,
+                    lines=lines, grep=grep, format=format,
+                )
 
             if format == "json":
                 data = await read_structured_spreadsheet(file_id, pages=pages)
@@ -179,7 +187,98 @@ class MuseDBClient:
 
             return text
         except Exception as e:
-            logger.debug("MuseDB read_file failed: %s", e)
+            logger.warning("MuseDB read_file failed for '%s': %s", filename, e)
+            return None
+
+    async def _read_from_filesystem(
+        self,
+        filename: str,
+        numbered: bool = False,
+        pages: str | None = None,
+        lines: str | None = None,
+        grep: str | None = None,
+        format: str | None = None,
+    ) -> str | None:
+        """Read a file directly from the filesystem when it's not indexed.
+
+        Uses the same parsers (PDF, DOCX, etc.) that the ingest pipeline uses,
+        so the output quality is identical to indexed reads.
+        """
+        import asyncio
+        import mimetypes
+
+        # Resolve the file path relative to workspace root
+        if self._mode == "embedded":
+            candidate = self._workspace_path / filename
+        else:
+            candidate = Path(filename)
+
+        if not candidate.exists():
+            # Try as absolute path
+            candidate = Path(filename)
+            if not candidate.exists():
+                logger.debug("Filesystem fallback: file not found '%s'", filename)
+                return None
+
+        # Determine MIME type
+        mime_type, _ = mimetypes.guess_type(str(candidate))
+        if not mime_type:
+            mime_type = "text/plain"
+
+        try:
+            from musedb_core.parsers.registry import parse_file
+            from musedb_core.utils.text import (
+                assemble_text,
+                format_with_line_numbers,
+                grep_with_context,
+                extract_lines,
+                build_line_index,
+            )
+
+            # Parse the file using registered parsers
+            result = await asyncio.to_thread(parse_file, candidate, mime_type)
+
+            # Assemble full text from pages
+            full_text, line_index, toc, page_line_ranges = assemble_text(
+                result.pages, mime_type
+            )
+
+            text = full_text
+
+            # Apply page filtering
+            if pages:
+                from musedb_core.services.read_service import parse_page_spec
+                page_spec = parse_page_spec(pages)
+                if isinstance(page_spec, list):
+                    parts = []
+                    for pn in page_spec:
+                        idx = pn - 1
+                        if 0 <= idx < len(page_line_ranges):
+                            start, end = page_line_ranges[idx]
+                            parts.append(extract_lines(text, line_index, start, end))
+                    text = "\n\n".join(parts) if parts else text
+
+            # Apply line filtering
+            if lines:
+                from musedb_core.services.read_service import parse_line_spec
+                start, end = parse_line_spec(lines)
+                text = extract_lines(text, line_index, start, end)
+
+            # Apply grep
+            if grep:
+                text = grep_with_context(text, grep, context=2)
+
+            # Apply line numbers
+            if numbered and not grep:
+                start_line = 1
+                if lines:
+                    parts_l = lines.strip().split("-")
+                    start_line = int(parts_l[0])
+                text = format_with_line_numbers(text, start=start_line)
+
+            return text
+        except Exception as e:
+            logger.warning("Filesystem fallback failed for '%s': %s", filename, e)
             return None
 
     # ------------------------------------------------------------------
@@ -203,7 +302,7 @@ class MuseDBClient:
             return None
         try:
             if mode == "grep" or (mode == "auto" and (path or glob)):
-                from app.services.grep_service import grep_files
+                from musedb_core.services.grep_service import grep_files
                 return await grep_files(
                     query=query,
                     path=path or ".",
@@ -213,10 +312,10 @@ class MuseDBClient:
                     max_results=max_results,
                 )
             else:
-                from app.services.search_service import search_files
+                from musedb_core.services.search_service import search_files
                 return await search_files(query=query, limit=limit, offset=offset)
         except Exception as e:
-            logger.debug("MuseDB search failed: %s", e)
+            logger.warning("MuseDB search failed: %s", e)
             return None
 
     # ------------------------------------------------------------------
@@ -268,7 +367,7 @@ class MuseDBClient:
         if not await self.is_available():
             return None
         try:
-            from app.services.index_service import index_directory
+            from musedb_core.services.index_service import index_directory
             return await index_directory(
                 dir_path=Path(path),
                 tags=tags or [],
@@ -287,7 +386,7 @@ class MuseDBClient:
         if not fp.exists():
             return None
         try:
-            from app.services.ingest_service import ingest_local_file
+            from musedb_core.services.ingest_service import ingest_local_file
             return await ingest_local_file(source_path=fp, tags=[], metadata={})
         except Exception as e:
             logger.debug("MuseDB upload_file failed: %s", e)
@@ -296,7 +395,7 @@ class MuseDBClient:
     async def list_watchers(self) -> list[dict] | None:
         """List active directory watchers."""
         try:
-            from app.services.watch_service import list_watches
+            from musedb_core.services.watch_service import list_watches
             return list_watches()
         except Exception as e:
             logger.debug("MuseDB list_watchers failed: %s", e)
@@ -314,8 +413,8 @@ class MuseDBClient:
             if self._mode == "embedded":
                 await self._workspace.close()
             else:
-                from app.storage import close_backend
-                from app.database import close_pool
+                from musedb_core.storage import close_backend
+                from musedb_core.database import close_pool
                 await close_backend()
                 await close_pool()
         except Exception:

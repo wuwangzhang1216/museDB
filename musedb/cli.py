@@ -52,7 +52,7 @@ def init(
     ocr: bool = typer.Option(True, help="Enable OCR for image/scanned PDFs"),
 ):
     """Initialise a MuseDB workspace (creates .musedb/ directory)."""
-    from app.workspace import Workspace, WorkspaceConfig
+    from musedb_core.workspace import Workspace, WorkspaceConfig
 
     config = WorkspaceConfig(ocr_enabled=ocr)
     ws = Workspace(root=path.resolve(), config=config)
@@ -76,7 +76,7 @@ def index(
     tags: str = typer.Option("", help="Comma-separated tags to apply"),
 ):
     """Index all supported files in a directory."""
-    from app.workspace import Workspace
+    from musedb_core.workspace import Workspace
 
     ws_root = workspace or path
     ws = Workspace.open(ws_root)
@@ -109,7 +109,7 @@ def search(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Search indexed files."""
-    from app.workspace import Workspace
+    from musedb_core.workspace import Workspace
 
     ws = Workspace.open(workspace)
 
@@ -152,7 +152,7 @@ def read(
     format: str = typer.Option(None, help="Output format: 'json' for spreadsheets"),
 ):
     """Read a file from the workspace."""
-    from app.workspace import Workspace
+    from musedb_core.workspace import Workspace
 
     ws = Workspace.open(workspace)
 
@@ -178,7 +178,7 @@ def serve_mcp(
     workspace: Path = typer.Option(Path("."), "--workspace", "-w", help="Workspace root"),
 ):
     """Start an MCP server in stdio transport (embedded mode, no PostgreSQL needed)."""
-    from app.workspace import Workspace
+    from musedb_core.workspace import Workspace
 
     ws = Workspace.open(workspace)
 
@@ -208,7 +208,7 @@ def serve(
 ):
     """Start the HTTP server in embedded (SQLite) mode."""
     import uvicorn
-    from app.config import settings
+    from musedb_core.config import settings
 
     # Configure for embedded mode
     settings.backend = "sqlite"
