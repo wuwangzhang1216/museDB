@@ -75,13 +75,16 @@ async def musedb_read(params: ReadInput) -> str:
     Supports page/line filtering, in-file grep, and OCR for scanned images.
     Use this for all file reading: source code, PDFs, Word docs, Excel sheets, images.
 
+    Workflow: Use musedb_glob first to discover files, then musedb_read to examine them.
+    If filename is ambiguous, use the full path from musedb_glob results.
+
     Args:
         params (ReadInput): Validated input parameters containing:
             - filename (str): File path, filename, partial match, or UUID
             - offset (int, optional): Start line number (1-based)
             - limit (int, optional): Max lines to return
             - pages (str, optional): Page range '1-3' or sheet name 'Revenue'
-            - grep (str, optional): Search within file, + for AND
+            - grep (str, optional): Search within file, + for AND (e.g. "revenue+growth" finds lines with both words)
             - format (str, optional): 'json' for structured spreadsheet data
 
     Returns:
@@ -133,9 +136,13 @@ async def musedb_read(params: ReadInput) -> str:
 async def musedb_search(params: SearchInput) -> str:
     """Search across code files (regex) and documents (full-text).
 
-    Auto-detects mode: use with path/glob for code search (grep), or plain query
-    for document full-text search (fts). Returns matches with file paths, line numbers,
-    and context.
+    Two modes:
+    - grep: Regex search on code files. Use when you have path/glob or need exact pattern matching.
+    - fts: Full-text keyword search on indexed documents (PDFs, Word, etc.). Use for natural language queries.
+    Auto-detects mode: path/glob present → grep, otherwise → fts.
+
+    When to use this vs musedb_read with grep: Use musedb_search to find WHICH files contain something.
+    Use musedb_read with grep param to search WITHIN a specific file you already know about.
 
     Args:
         params (SearchInput): Validated input parameters containing:
@@ -180,10 +187,10 @@ async def musedb_search(params: SearchInput) -> str:
     },
 )
 async def musedb_glob(params: GlobInput) -> str:
-    """Find files matching a glob pattern.
+    """Find files matching a glob pattern, sorted by modification time (newest first).
 
-    Returns file paths sorted by modification time (newest first).
-    Use to discover files before reading them.
+    Use this as the first step to discover files in a workspace before reading them with musedb_read.
+    Typical workflow: musedb_glob to find files → musedb_read to examine contents → musedb_search to find specific content.
 
     Args:
         params (GlobInput): Validated input parameters containing:

@@ -43,6 +43,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_files_checksum_ready
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
+CREATE INDEX IF NOT EXISTS idx_files_source_path
+    ON files(json_extract(metadata, '$.source_path')) WHERE status = 'ready';
 
 CREATE TABLE IF NOT EXISTS file_text (
     file_id     TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -188,24 +190,27 @@ class SQLiteBackend:
                 ),
             )
 
-            for i, page in enumerate(parse_result.pages):
-                line_start, line_end = page_line_ranges[i]
-                await self._db.execute(
+            page_rows = [
+                (
+                    file_id,
+                    page.page_number,
+                    page.section_title,
+                    page.content_type,
+                    page.text,
+                    page_line_ranges[i][0],
+                    page_line_ranges[i][1],
+                )
+                for i, page in enumerate(parse_result.pages)
+            ]
+            if page_rows:
+                await self._db.executemany(
                     """
                     INSERT INTO pages
                         (file_id, page_number, section_title,
                          content_type, text, line_start, line_end)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        file_id,
-                        page.page_number,
-                        page.section_title,
-                        page.content_type,
-                        page.text,
-                        line_start,
-                        line_end,
-                    ),
+                    page_rows,
                 )
 
             await self._db.execute(
@@ -353,16 +358,12 @@ class SQLiteBackend:
     async def find_by_source_path(self, source_path: str) -> str | None:
         """Find a file by its original source path (stored in metadata)."""
         async with self._db.execute(
-            "SELECT id, metadata FROM files WHERE status = 'ready'"
+            "SELECT id FROM files "
+            "WHERE json_extract(metadata, '$.source_path') = ? AND status = 'ready'",
+            (source_path,),
         ) as cur:
-            async for row in cur:
-                try:
-                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
-                    if meta.get("source_path") == source_path:
-                        return row["id"]
-                except (json.JSONDecodeError, TypeError):
-                    continue
-        return None
+            row = await cur.fetchone()
+        return row["id"] if row else None
 
     async def find_file_by_uuid(self, file_id_str: str) -> str | None:
         import uuid as _uuid
@@ -422,7 +423,8 @@ class SQLiteBackend:
 
         search_sql = f"""
             SELECT f.filename, f.id AS file_id, p.page_number, p.section_title,
-                   p.text, pages_fts.rank
+                   snippet(pages_fts, 0, '<mark>', '</mark>', '...', 30) AS highlight,
+                   pages_fts.rank
             FROM pages_fts
             JOIN pages p ON pages_fts.rowid = p.id
             JOIN files f ON p.file_id = f.id
@@ -449,17 +451,14 @@ class SQLiteBackend:
 
         results = []
         for r in rows:
-            highlight = _extract_highlight(r["text"], query)
             results.append(
                 {
-                    "filename": r["file_id"],  # will be overridden below
+                    "filename": r["filename"],
                     "file_id": r["file_id"],
                     "page_number": r["page_number"],
                     "section_title": r["section_title"],
-                    "highlight": highlight,
+                    "highlight": r["highlight"],
                     "relevance_score": round(abs(float(r["rank"])), 3),
-                    # Patch filename from f.filename
-                    "filename": r["filename"],
                 }
             )
         return {"total": total, "results": results}
@@ -620,16 +619,6 @@ def _escape_fts5(query: str) -> str:
     terms = [t.strip() for t in query.split() if t.strip()]
     escaped = [f'"{t}"' for t in terms]
     return " ".join(escaped)
-
-
-def _extract_highlight(text: str, query: str, max_len: int = 150) -> str:
-    """Extract a snippet around the first matching term."""
-    for term in query.split():
-        pos = text.lower().find(term.lower())
-        if pos >= 0:
-            start = max(0, pos - 50)
-            return text[start: start + max_len]
-    return text[:max_len]
 
 
 def _add_sqlite_filters(conditions: list[str], params: list, filters: dict) -> None:

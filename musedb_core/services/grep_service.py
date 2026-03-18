@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -19,6 +20,21 @@ async def grep_files(
 
     Returns matching lines with file paths, line numbers, and optional context.
     """
+    return await asyncio.to_thread(
+        _grep_files_sync,
+        query, path, glob, case_insensitive, context, max_results,
+    )
+
+
+def _grep_files_sync(
+    query: str,
+    path: str,
+    glob: str | None,
+    case_insensitive: bool,
+    context: int,
+    max_results: int,
+) -> dict:
+    """Synchronous grep implementation, run in a thread."""
     root = Path(path)
     if not root.is_dir():
         return {"total": 0, "results": [], "error": f"Directory not found: {path}"}
@@ -48,32 +64,32 @@ async def grep_files(
             continue
 
         lines = text.split("\n")
-        match_indices: list[int] = []
-
         for i, line in enumerate(lines):
-            if pattern.search(line):
-                match_indices.append(i)
+            if not pattern.search(line):
+                continue
 
-        if not match_indices:
-            continue
-
-        for idx in match_indices:
             total += 1
             if len(results) >= max_results:
-                continue
+                # Early break: stop scanning once we have enough results
+                # and have counted enough to know there are more
+                return {
+                    "total": total,
+                    "results": results,
+                    "truncated": True,
+                }
 
             ctx_before = []
             ctx_after = []
             if context > 0:
-                for c in range(max(0, idx - context), idx):
+                for c in range(max(0, i - context), i):
                     ctx_before.append(lines[c])
-                for c in range(idx + 1, min(len(lines), idx + context + 1)):
+                for c in range(i + 1, min(len(lines), i + context + 1)):
                     ctx_after.append(lines[c])
 
             results.append({
                 "file": rel,
-                "line": idx + 1,  # 1-indexed
-                "text": lines[idx],
+                "line": i + 1,  # 1-indexed
+                "text": line,
                 "context_before": ctx_before,
                 "context_after": ctx_after,
             })
@@ -81,7 +97,7 @@ async def grep_files(
     return {
         "total": total,
         "results": results,
-        "truncated": total > max_results,
+        "truncated": False,
     }
 
 

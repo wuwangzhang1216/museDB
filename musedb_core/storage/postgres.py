@@ -90,21 +90,25 @@ class PostgresBackend:
                         json.dumps(merged_metadata),
                     )
 
-                    for i, page in enumerate(parse_result.pages):
-                        line_start, line_end = page_line_ranges[i]
-                        await conn.execute(
+                    if parse_result.pages:
+                        await conn.executemany(
                             """
                             INSERT INTO pages (file_id, page_number, section_title,
                                                content_type, text, line_start, line_end)
                             VALUES ($1, $2, $3, $4, $5, $6, $7)
                             """,
-                            file_uuid,
-                            page.page_number,
-                            page.section_title,
-                            page.content_type,
-                            page.text,
-                            line_start,
-                            line_end,
+                            [
+                                (
+                                    file_uuid,
+                                    page.page_number,
+                                    page.section_title,
+                                    page.content_type,
+                                    page.text,
+                                    page_line_ranges[i][0],
+                                    page_line_ranges[i][1],
+                                )
+                                for i, page in enumerate(parse_result.pages)
+                            ],
                         )
 
                     await conn.execute(
@@ -261,6 +265,18 @@ class PostgresBackend:
     # ------------------------------------------------------------------
     # Filename resolution
     # ------------------------------------------------------------------
+
+    async def find_by_source_path(self, source_path: str) -> str | None:
+        """Find a file by its original source path (stored in metadata)."""
+        from musedb_core.database import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM files "
+                "WHERE metadata @> $1::jsonb AND status = 'ready'",
+                json.dumps({"source_path": source_path}),
+            )
+        return str(row["id"]) if row else None
 
     async def find_file_exact(self, filename: str) -> str | None:
         from musedb_core.database import get_pool
