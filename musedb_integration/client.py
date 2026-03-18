@@ -43,6 +43,8 @@ class MuseDBClient:
         pool_max: int = 10,
         *,
         workspace_path: str | Path | None = None,
+        workspace_root: str | Path | None = None,
+        openrouter_api_key: str | None = None,
     ):
         """
         Args:
@@ -53,6 +55,13 @@ class MuseDBClient:
             workspace_path: Path to a local workspace root. When provided,
                 activates **embedded mode** (SQLite) and overrides
                 ``database_url``.
+            workspace_root: The actual directory where user files live.
+                Defaults to ``workspace_path`` when not provided.  Use this
+                when the DB is stored in a sub-directory (e.g. per-session
+                isolation) but files reside in the parent workspace.
+            openrouter_api_key: OpenRouter API key. Enables LLM-based image
+                description via a free vision model. When provided, museDB
+                can read and describe images without Tesseract.
         """
         if workspace_path is not None:
             self._mode = "embedded"
@@ -67,8 +76,14 @@ class MuseDBClient:
             self._pool_min = pool_min
             self._pool_max = pool_max
 
+        self._workspace_root = (
+            Path(workspace_root) if workspace_root is not None
+            else getattr(self, "_workspace_path", None)
+        )
+        self._openrouter_api_key = openrouter_api_key
         self._initialized = False
         self._available: bool | None = None
+        self._watch_ids: list[str] = []
 
     async def init(self) -> None:
         """Initialize the client."""
@@ -83,6 +98,14 @@ class MuseDBClient:
     async def _init_embedded(self) -> None:
         try:
             from musedb_core.workspace import Workspace
+            from musedb_core.config import settings
+
+            # Activate vision if API key is provided
+            if self._openrouter_api_key:
+                settings.vision_enabled = True
+                settings.vision_api_key = self._openrouter_api_key
+                logger.info("museDB vision enabled (LLM image description active)")
+
             self._workspace = Workspace.open(self._workspace_path)
             await self._workspace.init()
             self._initialized = True
@@ -97,6 +120,11 @@ class MuseDBClient:
             from musedb_core.database import init_pool
             from musedb_core.config import settings
             from musedb_core.storage import init_backend
+
+            # Activate vision if API key is provided
+            if self._openrouter_api_key:
+                settings.vision_enabled = True
+                settings.vision_api_key = self._openrouter_api_key
 
             settings.database_url = self._database_url
             settings.db_pool_min = self._pool_min
@@ -203,13 +231,14 @@ class MuseDBClient:
 
         Uses the same parsers (PDF, DOCX, etc.) that the ingest pipeline uses,
         so the output quality is identical to indexed reads.
+        Images are handled via the async vision service directly.
         """
         import asyncio
         import mimetypes
 
         # Resolve the file path relative to workspace root
         if self._mode == "embedded":
-            candidate = self._workspace_path / filename
+            candidate = (self._workspace_root or self._workspace_path) / filename
         else:
             candidate = Path(filename)
 
@@ -224,6 +253,10 @@ class MuseDBClient:
         mime_type, _ = mimetypes.guess_type(str(candidate))
         if not mime_type:
             mime_type = "text/plain"
+
+        # Images: use vision service directly (async, no tesseract needed)
+        if mime_type.startswith("image/"):
+            return await self._read_image_via_vision(candidate)
 
         try:
             from musedb_core.parsers.registry import parse_file
@@ -279,6 +312,19 @@ class MuseDBClient:
             return text
         except Exception as e:
             logger.warning("Filesystem fallback failed for '%s': %s", filename, e)
+            return None
+
+    async def _read_image_via_vision(self, file_path: Path) -> str | None:
+        """Describe an image using the vision LLM service."""
+        try:
+            from musedb_core.services.vision_service import describe_image
+            from musedb_core.config import settings
+
+            api_key = settings.vision_api_key or None
+            text = await describe_image(file_path, api_key=api_key)
+            return text if text.strip() else None
+        except Exception as e:
+            logger.warning("Vision read failed for '%s': %s", file_path, e)
             return None
 
     # ------------------------------------------------------------------
@@ -402,13 +448,42 @@ class MuseDBClient:
             return None
 
     # ------------------------------------------------------------------
+    # Watch (auto-ingest on file changes)
+    # ------------------------------------------------------------------
+
+    async def start_watching(self, path: str | Path) -> str | None:
+        """Start watching a directory for file changes. Returns watch_id."""
+        if not await self.is_available():
+            return None
+        try:
+            from musedb_core.services.watch_service import start_watch
+            watch_id = start_watch(Path(path))
+            self._watch_ids.append(watch_id)
+            logger.info("Started watching: %s (id=%s)", path, watch_id)
+            return watch_id
+        except Exception as e:
+            logger.warning("Failed to start watch for %s: %s", path, e)
+            return None
+
+    def stop_watching(self) -> None:
+        """Stop all watchers started by this client."""
+        try:
+            from musedb_core.services.watch_service import stop_watch
+            for wid in self._watch_ids:
+                stop_watch(wid)
+            self._watch_ids.clear()
+        except Exception as e:
+            logger.debug("Failed to stop watches: %s", e)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close the backend."""
+        """Close the backend and stop watchers."""
         if not self._initialized:
             return
+        self.stop_watching()
         try:
             if self._mode == "embedded":
                 await self._workspace.close()

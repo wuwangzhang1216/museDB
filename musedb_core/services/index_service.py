@@ -75,23 +75,31 @@ async def index_directory(
     dir_path: Path,
     tags: list[str] | None = None,
     metadata: dict | None = None,
-    max_concurrent: int = 4,
+    max_concurrent: int = 8,
 ) -> dict:
     """Scan and ingest all supported files in a directory."""
     files = await asyncio.to_thread(
         scan_directory, dir_path, settings.index_exclude_patterns
     )
 
+    # Detect MIME types in parallel
+    mime_sem = asyncio.Semaphore(max_concurrent)
+
+    async def _detect_mime(f: Path) -> tuple[Path, str | None]:
+        async with mime_sem:
+            try:
+                mime = await asyncio.to_thread(magic.from_file, str(f), mime=True)
+                return (f, mime)
+            except Exception:
+                return (f, None)
+
+    mime_results = await asyncio.gather(*[_detect_mime(f) for f in files])
+
     supported: list[tuple[Path, str]] = []
     unsupported_files: list[Path] = []
 
-    for f in files:
-        try:
-            mime = magic.from_file(str(f), mime=True)
-        except Exception:
-            unsupported_files.append(f)
-            continue
-        if _has_parser(mime):
+    for f, mime in mime_results:
+        if mime and _has_parser(mime):
             supported.append((f, mime))
         else:
             unsupported_files.append(f)

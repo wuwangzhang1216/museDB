@@ -93,8 +93,23 @@ async def _parse_and_persist(
     source_stat_result,
 ) -> dict:
     """Parse the file, enrich metadata, and persist via the active backend."""
+    from musedb_core.parsers.base import Page
+
     parse_result = await asyncio.to_thread(parse_file, file_path, mime_type)
     logger.info("Parsed %s: %d pages", original_filename, len(parse_result.pages))
+
+    # For images: enhance with LLM vision description (async, no Tesseract needed)
+    if mime_type.startswith("image/") and settings.vision_enabled:
+        try:
+            from musedb_core.services.vision_service import describe_image
+            description = await describe_image(file_path, api_key=settings.vision_api_key or None)
+            if description.strip() and not description.startswith("("):
+                parse_result.pages = [
+                    Page(page_number=1, section_title=None, text=description.strip())
+                ]
+                logger.info("Vision described %s: %d chars", original_filename, len(description))
+        except Exception as e:
+            logger.warning("Vision failed for %s, keeping parser output: %s", original_filename, e)
 
     full_text, line_index, toc, page_line_ranges = await asyncio.to_thread(
         assemble_text, parse_result.pages, mime_type
@@ -237,7 +252,22 @@ async def ingest_local_file(
             shutil.rmtree(file_dir, ignore_errors=True)
             return dup
 
+        # Upsert: if a file from the same source path exists but content changed,
+        # delete the old record so we can re-ingest with the new content.
+        existing = await backend.find_by_source_path(str(source_path))
+        if existing:
+            old_path = await backend.delete_file(existing)
+            if old_path:
+                old_dir = Path(old_path).parent
+                if old_dir.exists() and old_dir != settings.file_storage_path:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+            logger.info("Re-ingesting modified file: %s", source_path)
+
         await asyncio.to_thread(shutil.copy2, source_path, file_path)
+
+        # Store source path in metadata for upsert matching
+        merged_meta = dict(metadata or {})
+        merged_meta["source_path"] = str(source_path)
 
         return await _parse_and_persist(
             file_id=file_id,
@@ -247,7 +277,7 @@ async def ingest_local_file(
             file_size=file_size,
             checksum=checksum,
             tags=tags or [],
-            metadata=metadata or {},
+            metadata=merged_meta,
             source_stat_result=source_stat,
         )
 

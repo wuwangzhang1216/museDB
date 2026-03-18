@@ -100,6 +100,10 @@ class StorageBackend(Protocol):
         """Exact filename match → file UUID string, or None."""
         ...
 
+    async def find_by_source_path(self, source_path: str) -> str | None:
+        """Find a file by its original source path (stored in metadata)."""
+        ...
+
     async def find_file_by_uuid(self, file_id_str: str) -> str | None:
         """UUID lookup → file UUID string if it exists, or None."""
         ...

@@ -350,6 +350,20 @@ class SQLiteBackend:
             row = await cur.fetchone()
         return row["id"] if row else None
 
+    async def find_by_source_path(self, source_path: str) -> str | None:
+        """Find a file by its original source path (stored in metadata)."""
+        async with self._db.execute(
+            "SELECT id, metadata FROM files WHERE status = 'ready'"
+        ) as cur:
+            async for row in cur:
+                try:
+                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                    if meta.get("source_path") == source_path:
+                        return row["id"]
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        return None
+
     async def find_file_by_uuid(self, file_id_str: str) -> str | None:
         import uuid as _uuid
         try:

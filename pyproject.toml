@@ -48,9 +48,10 @@ mcp = [
 integration = [
     "httpx>=0.28.0",
 ]
-# Embedded mode: SQLite backend + CLI
+# Embedded mode: SQLite backend + CLI + vision
 embedded = [
     "aiosqlite>=0.19.0",
+    "httpx>=0.27.0",
 ]
 cli = [
     "aiosqlite>=0.19.0",

@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     ocr_enabled: bool = True
     ocr_languages: str = "eng+chi_sim+chi_tra"
 
+    # Vision (LLM-based image description — replaces Tesseract for images)
+    vision_enabled: bool = True
+    vision_api_key: str = ""  # OpenRouter API key; falls back to env OPENROUTER_API_KEY
+
     # Directory indexing
     index_max_concurrent: int = 4
     index_exclude_patterns: list[str] = []
