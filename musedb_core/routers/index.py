@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 
 from musedb_core.services.index_service import index_directory
-from musedb_core.services.watch_service import get_watch, list_watches, stop_watch
+from musedb_core.services.watch_service import get_watch, list_watches, start_watch, stop_watch
 
 # Ensure all parsers are registered
 import musedb_core.parsers.text  # noqa: F401
@@ -46,6 +46,11 @@ async def index_directory_endpoint(
         metadata=parsed_metadata,
         max_concurrent=max_concurrent,
     )
+
+    # Start watching for future changes (previously embedded in index_directory)
+    watch_id = start_watch(dir_path, tags=parsed_tags, metadata=parsed_metadata)
+    result["watch_id"] = watch_id
+
     return result
 
 

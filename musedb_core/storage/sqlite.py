@@ -13,6 +13,7 @@ Schema notes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -110,6 +111,7 @@ class SQLiteBackend:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = Path(db_path)
         self._db = None  # aiosqlite.Connection
+        self._write_lock = asyncio.Lock()
 
     async def init(self) -> None:
         try:
@@ -121,7 +123,7 @@ class SQLiteBackend:
             )
 
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(self._db_path))
+        self._db = await aiosqlite.connect(str(self._db_path), isolation_level=None)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
@@ -169,79 +171,80 @@ class SQLiteBackend:
         toc: str,
         page_line_ranges: list[tuple[int, int]],
     ) -> dict:
-        try:
-            await self._db.execute("BEGIN")
-            await self._db.execute(
-                """
-                INSERT INTO files
-                    (id, filename, mime_type, file_size, file_path,
-                     checksum, status, tags, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, 'processing', ?, ?)
-                """,
-                (
-                    file_id,
-                    original_filename,
-                    mime_type,
-                    file_size,
-                    file_path,
-                    checksum,
-                    json.dumps(tags),
-                    json.dumps(merged_metadata),
-                ),
-            )
-
-            page_rows = [
-                (
-                    file_id,
-                    page.page_number,
-                    page.section_title,
-                    page.content_type,
-                    page.text,
-                    page_line_ranges[i][0],
-                    page_line_ranges[i][1],
-                )
-                for i, page in enumerate(parse_result.pages)
-            ]
-            if page_rows:
-                await self._db.executemany(
+        async with self._write_lock:
+            try:
+                await self._db.execute("BEGIN")
+                await self._db.execute(
                     """
-                    INSERT INTO pages
-                        (file_id, page_number, section_title,
-                         content_type, text, line_start, line_end)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO files
+                        (id, filename, mime_type, file_size, file_path,
+                         checksum, status, tags, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, 'processing', ?, ?)
                     """,
-                    page_rows,
+                    (
+                        file_id,
+                        original_filename,
+                        mime_type,
+                        file_size,
+                        file_path,
+                        checksum,
+                        json.dumps(tags),
+                        json.dumps(merged_metadata),
+                    ),
                 )
 
-            await self._db.execute(
-                """
-                INSERT INTO file_text
-                    (file_id, full_text, total_lines, line_index, toc)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    file_id,
-                    full_text,
-                    total_lines,
-                    json.dumps(line_index),
-                    toc,
-                ),
-            )
+                page_rows = [
+                    (
+                        file_id,
+                        page.page_number,
+                        page.section_title,
+                        page.content_type,
+                        page.text,
+                        page_line_ranges[i][0],
+                        page_line_ranges[i][1],
+                    )
+                    for i, page in enumerate(parse_result.pages)
+                ]
+                if page_rows:
+                    await self._db.executemany(
+                        """
+                        INSERT INTO pages
+                            (file_id, page_number, section_title,
+                             content_type, text, line_start, line_end)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        page_rows,
+                    )
 
-            await self._db.execute(
-                "UPDATE files SET status = 'ready', metadata = ? WHERE id = ?",
-                (json.dumps(merged_metadata), file_id),
-            )
-            await self._db.commit()
+                await self._db.execute(
+                    """
+                    INSERT INTO file_text
+                        (file_id, full_text, total_lines, line_index, toc)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        file_id,
+                        full_text,
+                        total_lines,
+                        json.dumps(line_index),
+                        toc,
+                    ),
+                )
 
-        except Exception as exc:
-            await self._db.rollback()
-            # Detect unique-constraint violation (duplicate checksum)
-            if "UNIQUE constraint failed" in str(exc):
-                dup = await self.check_duplicate(checksum)
-                if dup:
-                    return dup
-            raise
+                await self._db.execute(
+                    "UPDATE files SET status = 'ready', metadata = ? WHERE id = ?",
+                    (json.dumps(merged_metadata), file_id),
+                )
+                await self._db.commit()
+
+            except Exception as exc:
+                await self._db.rollback()
+                # Detect unique-constraint violation (duplicate checksum)
+                if "UNIQUE constraint failed" in str(exc):
+                    dup = await self.check_duplicate(checksum)
+                    if dup:
+                        return dup
+                raise
 
         return {
             "id": file_id,

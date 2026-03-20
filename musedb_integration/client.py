@@ -100,8 +100,10 @@ class MuseDBClient:
             from musedb_core.workspace import Workspace
             from musedb_core.config import settings
 
-            # Activate vision if API key is provided
-            if self._openrouter_api_key:
+            # Configure vision settings if an API key is provided and not
+            # already set (the caller — e.g. MuseDBManager — may have
+            # configured this globally at startup already).
+            if self._openrouter_api_key and not settings.vision_api_key:
                 settings.vision_enabled = True
                 settings.vision_api_key = self._openrouter_api_key
                 logger.info("museDB vision enabled (LLM image description active)")
@@ -121,8 +123,8 @@ class MuseDBClient:
             from musedb_core.config import settings
             from musedb_core.storage import init_backend
 
-            # Activate vision if API key is provided
-            if self._openrouter_api_key:
+            # Configure vision if not already set globally
+            if self._openrouter_api_key and not settings.vision_api_key:
                 settings.vision_enabled = True
                 settings.vision_api_key = self._openrouter_api_key
 

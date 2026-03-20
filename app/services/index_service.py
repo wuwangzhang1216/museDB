@@ -140,9 +140,6 @@ async def index_directory(
     failed = sum(1 for r in results if r["status"] == "failed")
     unsupported = sum(1 for r in results if r["status"] == "unsupported")
 
-    from app.services.watch_service import start_watch
-    watch_id = start_watch(dir_path.resolve(), tags=tags, metadata=metadata)
-
     return {
         "path": str(dir_path.resolve()),
         "total_files": len(files),
@@ -150,6 +147,5 @@ async def index_directory(
         "skipped": skipped,
         "failed": failed,
         "unsupported": unsupported,
-        "watch_id": watch_id,
         "files": results,
     }
