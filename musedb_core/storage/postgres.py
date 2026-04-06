@@ -362,7 +362,8 @@ class PostgresBackend:
                     ts_rank_cd(p.tsv, plainto_tsquery('english', $1)) AS relevance_score,
                     ts_headline('english', p.text, plainto_tsquery('english', $1),
                         'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15'
-                    ) AS highlight
+                    ) AS highlight,
+                    f.updated_at
                 FROM pages p
                 JOIN files f ON f.id = p.file_id
                 WHERE {where_clause}
@@ -387,6 +388,7 @@ class PostgresBackend:
                     "section_title": r["section_title"],
                     "highlight": r["highlight"],
                     "relevance_score": round(float(r["relevance_score"]), 3),
+                    "updated_at": r["updated_at"].isoformat() + "Z" if r["updated_at"] else None,
                 }
                 for r in rows
             ],
@@ -414,7 +416,8 @@ class PostgresBackend:
                 SELECT
                     f.filename, f.id AS file_id, p.page_number, p.section_title,
                     1.0 AS relevance_score,
-                    substring(p.text FROM position($2 IN p.text) - 50 FOR 150) AS highlight
+                    substring(p.text FROM position($2 IN p.text) - 50 FOR 150) AS highlight,
+                    f.updated_at
                 FROM pages p
                 JOIN files f ON f.id = p.file_id
                 WHERE {where_clause}
@@ -439,6 +442,7 @@ class PostgresBackend:
                     "section_title": r["section_title"],
                     "highlight": r["highlight"] or "",
                     "relevance_score": 1.0,
+                    "updated_at": r["updated_at"].isoformat() + "Z" if r["updated_at"] else None,
                 }
                 for r in rows
             ],
@@ -553,6 +557,43 @@ class PostgresBackend:
                 _uuid.UUID(file_id),
             )
         return row["file_path"]
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    async def get_workspace_stats(self) -> dict:
+        from musedb_core.database import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            status_rows = await conn.fetch(
+                "SELECT status, COUNT(*) AS cnt FROM files GROUP BY status"
+            )
+            by_status = {r["status"]: r["cnt"] for r in status_rows}
+
+            type_rows = await conn.fetch(
+                "SELECT mime_type, COUNT(*) AS cnt FROM files "
+                "WHERE status = 'ready' GROUP BY mime_type ORDER BY cnt DESC"
+            )
+            by_type = [(r["mime_type"], r["cnt"]) for r in type_rows]
+
+            recent_rows = await conn.fetch(
+                "SELECT filename, updated_at FROM files "
+                "WHERE status = 'ready' ORDER BY updated_at DESC LIMIT 5"
+            )
+            recent = [
+                {
+                    "filename": r["filename"],
+                    "updated_at": r["updated_at"].isoformat() + "Z" if r["updated_at"] else None,
+                }
+                for r in recent_rows
+            ]
+
+        return {
+            "by_status": by_status,
+            "by_type": by_type,
+            "recent": recent,
+        }
 
 
 # ---------------------------------------------------------------------------

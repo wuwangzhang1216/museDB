@@ -10,6 +10,7 @@ from musedb_core.services.watch_service import stop_all as stop_all_watchers
 from musedb_core.routers.files import router as files_router
 from musedb_core.routers.glob import router as glob_router
 from musedb_core.routers.health import router as health_router
+from musedb_core.routers.info import router as info_router
 from musedb_core.routers.index import router as index_router
 from musedb_core.routers.read import router as read_router
 from musedb_core.routers.search import router as search_router
@@ -80,6 +81,7 @@ async def value_error_handler(request: Request, exc: ValueError):
 
 
 app.include_router(health_router)
+app.include_router(info_router)
 app.include_router(files_router)
 app.include_router(glob_router)
 app.include_router(index_router)

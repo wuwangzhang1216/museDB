@@ -196,6 +196,12 @@ class Workspace:
         from musedb_core.services.search_service import search_files
         return await search_files(query=query, limit=limit, offset=offset)
 
+    async def info(self) -> dict:
+        """Return workspace statistics."""
+        from musedb_core.storage import get_backend
+        backend = get_backend()
+        return await backend.get_workspace_stats()
+
     async def glob(self, pattern: str, path: str | Path | None = None) -> dict:
         """Find files matching a glob pattern."""
         import os

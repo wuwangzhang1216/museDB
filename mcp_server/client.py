@@ -169,13 +169,17 @@ async def search(
             best_page = best.get("page_number", "?")
             section = best.get("section_title", "")
             highlight = best.get("highlight", "")
+            updated = best.get("updated_at", "")
             loc = f"page {best_page}"
             if section:
                 loc = f"{section} ({loc})"
             match_count = len(rows)
+            score_part = f"score: {score}"
+            if updated:
+                score_part += f", updated: {updated}"
             header = (
                 f"  {filename} ({match_count} match{'es' if match_count != 1 else ''}, "
-                f"best: {loc}) [score: {score}]"
+                f"best: {loc}) [{score_part}]"
             )
             lines_out.append(header)
             lines_out.append(f"    {highlight}")
@@ -189,6 +193,38 @@ async def search(
 
     if data.get("truncated"):
         lines_out.append(f"... (truncated at {len(results)} results, {total} total)")
+
+    return "\n".join(lines_out)
+
+
+async def get_info() -> str:
+    """Call GET /info and format as readable text."""
+    client = await get_client()
+    response = await client.get("/info")
+
+    if response.status_code != 200:
+        return _handle_error(response)
+
+    data = response.json()
+    by_status = data.get("by_status", {})
+    by_type = data.get("by_type", [])
+    recent = data.get("recent", [])
+
+    total = sum(by_status.values())
+    status_parts = [f"{s}: {c}" for s, c in sorted(by_status.items())]
+    lines_out = [f"Workspace: {total} files ({', '.join(status_parts)})"]
+
+    if by_type:
+        lines_out.append("")
+        lines_out.append("By type:")
+        for mime, count in by_type:
+            lines_out.append(f"  {mime:<40} {count} files")
+
+    if recent:
+        lines_out.append("")
+        lines_out.append("Recently updated:")
+        for r in recent:
+            lines_out.append(f"  {r['filename']:<40} {r.get('updated_at', '?')}")
 
     return "\n".join(lines_out)
 

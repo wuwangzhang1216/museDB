@@ -69,3 +69,9 @@ class GlobInput(BaseModel):
     path: str | None = Field(
         None, description="Root directory to search in"
     )
+
+
+class InfoInput(BaseModel):
+    """Input for workspace info (no parameters needed)."""
+
+    model_config = ConfigDict(extra="forbid")

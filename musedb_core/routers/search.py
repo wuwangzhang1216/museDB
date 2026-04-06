@@ -32,6 +32,7 @@ class SearchResultItem(BaseModel):
     section_title: str | None = None
     highlight: str | None = None
     relevance_score: float | None = None
+    updated_at: str | None = None
     # Grep-specific fields
     file: str | None = None
     line: int | None = None

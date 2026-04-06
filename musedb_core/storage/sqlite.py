@@ -439,7 +439,7 @@ class SQLiteBackend:
         search_sql = f"""
             SELECT f.filename, f.id AS file_id, p.page_number, p.section_title,
                    snippet(pages_fts, 0, '<mark>', '</mark>', '...', 30) AS highlight,
-                   pages_fts.rank
+                   pages_fts.rank, f.updated_at
             FROM pages_fts
             JOIN pages p ON pages_fts.rowid = p.id
             JOIN files f ON p.file_id = f.id
@@ -474,6 +474,7 @@ class SQLiteBackend:
                     "section_title": r["section_title"],
                     "highlight": r["highlight"],
                     "relevance_score": round(abs(float(r["rank"])), 3),
+                    "updated_at": r["updated_at"],
                 }
             )
         return {"total": total, "results": results}
@@ -488,7 +489,8 @@ class SQLiteBackend:
         n = len(params)
 
         search_sql = f"""
-            SELECT f.filename, f.id AS file_id, p.page_number, p.section_title, p.text
+            SELECT f.filename, f.id AS file_id, p.page_number, p.section_title, p.text,
+                   f.updated_at
             FROM pages p
             JOIN files f ON f.id = p.file_id
             WHERE {where_clause}
@@ -519,6 +521,7 @@ class SQLiteBackend:
                     "section_title": r["section_title"],
                     "highlight": highlight,
                     "relevance_score": 1.0,
+                    "updated_at": r["updated_at"],
                 }
             )
         return {"total": total, "results": results}
@@ -623,6 +626,43 @@ class SQLiteBackend:
         await self._db.execute("DELETE FROM files WHERE id = ?", (file_id,))
         await self._db.commit()
         return file_path
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    async def get_workspace_stats(self) -> dict:
+        # File counts by status
+        async with self._db.execute(
+            "SELECT status, COUNT(*) AS cnt FROM files GROUP BY status"
+        ) as cur:
+            status_rows = await cur.fetchall()
+        by_status = {r["status"]: r["cnt"] for r in status_rows}
+
+        # File counts by MIME type (ready only)
+        async with self._db.execute(
+            "SELECT mime_type, COUNT(*) AS cnt FROM files "
+            "WHERE status = 'ready' GROUP BY mime_type ORDER BY cnt DESC"
+        ) as cur:
+            type_rows = await cur.fetchall()
+        by_type = [(r["mime_type"], r["cnt"]) for r in type_rows]
+
+        # Recently modified files (top 5)
+        async with self._db.execute(
+            "SELECT filename, updated_at FROM files "
+            "WHERE status = 'ready' ORDER BY updated_at DESC LIMIT 5"
+        ) as cur:
+            recent_rows = await cur.fetchall()
+        recent = [
+            {"filename": r["filename"], "updated_at": r["updated_at"]}
+            for r in recent_rows
+        ]
+
+        return {
+            "by_status": by_status,
+            "by_type": by_type,
+            "recent": recent,
+        }
 
 
 # ---------------------------------------------------------------------------

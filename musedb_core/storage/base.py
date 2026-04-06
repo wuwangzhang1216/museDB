@@ -174,3 +174,11 @@ class StorageBackend(Protocol):
         Returns None if the file does not exist.
         """
         ...
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    async def get_workspace_stats(self) -> dict:
+        """Return workspace statistics: file counts by status/type, recent files."""
+        ...

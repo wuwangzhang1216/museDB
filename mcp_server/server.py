@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server.client import close_client
-from mcp_server.models import GlobInput, ReadInput, SearchInput
+from mcp_server.models import GlobInput, InfoInput, ReadInput, SearchInput
 from mcp_server import client as musedb
 
 # ---------------------------------------------------------------------------
@@ -209,3 +209,28 @@ async def musedb_glob(params: GlobInput) -> str:
         pattern=params.pattern,
         path=params.path,
     )
+
+
+@mcp.tool(
+    name="musedb_info",
+    annotations={
+        "title": "Workspace Info",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def musedb_info(params: InfoInput) -> str:
+    """Get workspace overview: file counts by status and type, recently updated files.
+
+    Use this as the first step when entering a new workspace to understand what's available
+    before searching or reading files.
+
+    Returns:
+        str: Workspace statistics including total files, type distribution, and recent activity.
+
+    Examples:
+        - Get workspace overview: (no parameters needed)
+    """
+    return await musedb.get_info()
