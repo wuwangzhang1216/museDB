@@ -18,13 +18,19 @@
     </text>
   </g>
 
+  <!-- Decorative line -->
+  <line x1="280" y1="165" x2="750" y2="165" stroke="#333" stroke-width="1"/>
+
   <!-- Tagline -->
-  <g transform="translate(280, 190)">
-    <text x="0" y="0" font-family="'SF Pro Text', 'Helvetica Neue', Arial, sans-serif" font-size="24" fill="#888" font-weight="400">
-      cat + grep for any file format
+  <g transform="translate(280, 195)">
+    <text x="0" y="0" font-family="'SF Pro Text', 'Helvetica Neue', Arial, sans-serif" font-size="22" fill="#888" font-weight="400">
+      The file database built for AI agents
     </text>
   </g>
 
-  <!-- Decorative line -->
-  <line x1="280" y1="165" x2="750" y2="165" stroke="#333" stroke-width="1"/>
+  <!-- Version badge -->
+  <g transform="translate(280, 230)">
+    <rect x="0" y="0" width="52" height="22" rx="4" fill="#888" opacity="0.15"/>
+    <text x="26" y="15" font-family="'SF Mono', 'Fira Code', monospace" font-size="12" fill="#888" text-anchor="middle" font-weight="600">v1.0</text>
+  </g>
 </svg>
