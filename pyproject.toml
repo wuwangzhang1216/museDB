@@ -38,6 +38,7 @@ dependencies = [
     "python-magic>=0.4.27; sys_platform != 'win32'",
     "pydantic-settings>=2.0.0",
     "watchdog>=4.0.0",
+    "jieba>=0.42.1",
 ]
 
 [project.optional-dependencies]

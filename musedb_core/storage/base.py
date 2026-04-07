@@ -131,13 +131,10 @@ class StorageBackend(Protocol):
     async def search_fts(
         self, query: str, filters: dict, limit: int, offset: int
     ) -> dict:
-        """Full-text search → {total, results[...]}."""
-        ...
+        """Full-text search → {total, results[...]}.
 
-    async def search_cjk(
-        self, query: str, filters: dict, limit: int, offset: int
-    ) -> dict:
-        """CJK substring search → {total, results[...]}."""
+        Handles both Latin and CJK queries (CJK tokenized via jieba).
+        """
         ...
 
     # ------------------------------------------------------------------

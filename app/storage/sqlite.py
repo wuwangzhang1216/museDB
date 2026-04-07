@@ -7,8 +7,7 @@ Schema notes:
 - tags stored as JSON text (e.g. '["tag1","tag2"]')
 - metadata stored as JSON text
 - line_index stored as JSON text (list of int byte offsets)
-- pages.id is INTEGER (rowid), used as the FTS5 content rowid
-- pages_fts is a content-table FTS5 virtual table
+- pages_fts is a standalone FTS5 virtual table (jieba-tokenized text)
 """
 
 from __future__ import annotations
@@ -67,24 +66,7 @@ CREATE TABLE IF NOT EXISTS pages (
 
 CREATE INDEX IF NOT EXISTS idx_pages_file ON pages(file_id, page_number);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
-    text,
-    content='pages',
-    content_rowid='id'
-);
-
-CREATE TRIGGER IF NOT EXISTS pages_ai AFTER INSERT ON pages BEGIN
-    INSERT INTO pages_fts(rowid, text) VALUES (new.id, new.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS pages_ad AFTER DELETE ON pages BEGIN
-    INSERT INTO pages_fts(pages_fts, rowid, text) VALUES ('delete', old.id, old.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages BEGIN
-    INSERT INTO pages_fts(pages_fts, rowid, text) VALUES ('delete', old.id, old.text);
-    INSERT INTO pages_fts(rowid, text) VALUES (new.id, new.text);
-END;
+CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(text);
 
 CREATE TRIGGER IF NOT EXISTS files_updated AFTER UPDATE ON files
     WHEN old.updated_at = new.updated_at
@@ -121,9 +103,46 @@ class SQLiteBackend:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self._db_path))
         self._db.row_factory = aiosqlite.Row
+        await self._migrate_fts_if_needed()
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
         logger.info("SQLite backend initialised at %s", self._db_path)
+
+    async def _migrate_fts_if_needed(self) -> None:
+        """Migrate old content-table FTS5 to standalone + jieba tokenization."""
+        try:
+            async with self._db.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'pages_fts'"
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return  # Fresh DB, no migration needed
+            create_sql = row[0] or ""
+            if "content=" not in create_sql:
+                return  # Already standalone
+            logger.info("Migrating pages_fts to standalone FTS5 with jieba tokenization...")
+            await self._db.execute("DROP TRIGGER IF EXISTS pages_ai")
+            await self._db.execute("DROP TRIGGER IF EXISTS pages_ad")
+            await self._db.execute("DROP TRIGGER IF EXISTS pages_au")
+            await self._db.execute("DROP TABLE IF EXISTS pages_fts")
+            await self._db.execute(
+                "CREATE VIRTUAL TABLE pages_fts USING fts5(text)"
+            )
+            from musedb_core.utils.tokenizer import tokenize_for_fts
+            async with self._db.execute(
+                "SELECT id, text FROM pages ORDER BY id"
+            ) as cur:
+                rows = await cur.fetchall()
+            if rows:
+                fts_rows = [(r["id"], tokenize_for_fts(r["text"])) for r in rows]
+                await self._db.executemany(
+                    "INSERT INTO pages_fts(rowid, text) VALUES (?, ?)",
+                    fts_rows,
+                )
+            await self._db.commit()
+            logger.info("FTS migration complete — %d pages re-indexed.", len(rows) if rows else 0)
+        except Exception:
+            pass
 
     async def close(self) -> None:
         if self._db:
@@ -188,6 +207,8 @@ class SQLiteBackend:
                 ),
             )
 
+            from musedb_core.utils.tokenizer import tokenize_for_fts
+
             for i, page in enumerate(parse_result.pages):
                 line_start, line_end = page_line_ranges[i]
                 await self._db.execute(
@@ -207,6 +228,19 @@ class SQLiteBackend:
                         line_end,
                     ),
                 )
+
+            # Insert tokenized text into standalone FTS5 index
+            if parse_result.pages:
+                async with self._db.execute(
+                    "SELECT id, text FROM pages WHERE file_id = ? ORDER BY page_number",
+                    (file_id,),
+                ) as cur:
+                    page_id_rows = await cur.fetchall()
+                for r in page_id_rows:
+                    await self._db.execute(
+                        "INSERT INTO pages_fts(rowid, text) VALUES (?, ?)",
+                        (r["id"], tokenize_for_fts(r["text"])),
+                    )
 
             await self._db.execute(
                 """
@@ -398,8 +432,10 @@ class SQLiteBackend:
     async def search_fts(
         self, query: str, filters: dict, limit: int, offset: int
     ) -> dict:
-        # FTS5 MATCH query — escape special chars minimally
-        fts_query = _escape_fts5(query)
+        from musedb_core.utils.tokenizer import tokenize_for_fts
+
+        # Tokenize query (handles CJK via jieba) then escape for FTS5
+        fts_query = _escape_fts5(tokenize_for_fts(query))
 
         conditions = ["f.status = 'ready'"]
         params: list = []
@@ -408,7 +444,7 @@ class SQLiteBackend:
 
         search_sql = f"""
             SELECT f.filename, f.id AS file_id, p.page_number, p.section_title,
-                   p.text, pages_fts.rank
+                   p.text, pages_fts.rank, f.updated_at
             FROM pages_fts
             JOIN pages p ON pages_fts.rowid = p.id
             JOIN files f ON p.file_id = f.id
@@ -435,62 +471,15 @@ class SQLiteBackend:
 
         results = []
         for r in rows:
-            highlight = _extract_highlight(r["text"], query)
             results.append(
                 {
-                    "filename": r["file_id"],  # will be overridden below
+                    "filename": r["filename"],
                     "file_id": r["file_id"],
                     "page_number": r["page_number"],
                     "section_title": r["section_title"],
-                    "highlight": highlight,
+                    "highlight": _build_highlight(r["text"], query),
                     "relevance_score": round(abs(float(r["rank"])), 3),
-                    # Patch filename from f.filename
-                    "filename": r["filename"],
-                }
-            )
-        return {"total": total, "results": results}
-
-    async def search_cjk(
-        self, query: str, filters: dict, limit: int, offset: int
-    ) -> dict:
-        conditions = ["p.text LIKE ?", "f.status = 'ready'"]
-        params: list = [f"%{query}%"]
-        _add_sqlite_filters(conditions, params, filters)
-        where_clause = " AND ".join(conditions)
-        n = len(params)
-
-        search_sql = f"""
-            SELECT f.filename, f.id AS file_id, p.page_number, p.section_title, p.text
-            FROM pages p
-            JOIN files f ON f.id = p.file_id
-            WHERE {where_clause}
-            ORDER BY f.created_at DESC, p.page_number
-            LIMIT ? OFFSET ?
-        """
-        count_sql = f"""
-            SELECT COUNT(*) FROM pages p JOIN files f ON f.id = p.file_id
-            WHERE {where_clause}
-        """
-
-        async with self._db.execute(search_sql, [*params, limit, offset]) as cur:
-            rows = await cur.fetchall()
-        async with self._db.execute(count_sql, params) as cur:
-            total_row = await cur.fetchone()
-        total = total_row[0] if total_row else 0
-
-        results = []
-        for r in rows:
-            text = r["text"]
-            pos = text.lower().find(query.lower())
-            highlight = text[max(0, pos - 50): pos + 100] if pos >= 0 else text[:150]
-            results.append(
-                {
-                    "filename": r["filename"],
-                    "file_id": r["file_id"],
-                    "page_number": r["page_number"],
-                    "section_title": r["section_title"],
-                    "highlight": highlight,
-                    "relevance_score": 1.0,
+                    "updated_at": r["updated_at"],
                 }
             )
         return {"total": total, "results": results}
@@ -592,6 +581,12 @@ class SQLiteBackend:
         if not row:
             return None
         file_path = row["file_path"]
+        # Clean up standalone FTS5 index before cascade deletes pages
+        await self._db.execute(
+            "DELETE FROM pages_fts WHERE rowid IN "
+            "(SELECT id FROM pages WHERE file_id = ?)",
+            (file_id,),
+        )
         await self._db.execute("DELETE FROM files WHERE id = ?", (file_id,))
         await self._db.commit()
         return file_path
@@ -608,14 +603,27 @@ def _escape_fts5(query: str) -> str:
     return " ".join(escaped)
 
 
-def _extract_highlight(text: str, query: str, max_len: int = 150) -> str:
-    """Extract a snippet around the first matching term."""
-    for term in query.split():
-        pos = text.lower().find(term.lower())
-        if pos >= 0:
-            start = max(0, pos - 50)
-            return text[start: start + max_len]
-    return text[:max_len]
+def _build_highlight(text: str, query: str, context_chars: int = 80) -> str:
+    """Build a highlight snippet from original text by finding query terms."""
+    terms = [t.strip().lower() for t in query.split() if t.strip()]
+    if not terms:
+        return text[:150]
+    text_lower = text.lower()
+    best_pos = -1
+    for term in terms:
+        pos = text_lower.find(term)
+        if pos >= 0 and (best_pos < 0 or pos < best_pos):
+            best_pos = pos
+    if best_pos < 0:
+        return text[:150]
+    start = max(0, best_pos - context_chars)
+    end = min(len(text), best_pos + context_chars)
+    snippet = text[start:end]
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet
 
 
 def _add_sqlite_filters(conditions: list[str], params: list, filters: dict) -> None:
