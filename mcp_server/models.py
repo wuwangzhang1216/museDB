@@ -93,6 +93,9 @@ class MemoryStoreInput(BaseModel):
         "semantic",
         description="Type: 'episodic' (past events), 'semantic' (facts/knowledge), 'procedural' (workflows/rules)",
     )
+    pinned: bool = Field(
+        False, description="Pin this memory so it always surfaces first in recall results"
+    )
     tags: list[str] = Field(
         default_factory=list, description="Tags for categorization"
     )
@@ -107,7 +110,7 @@ class MemoryRecallInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     query: str = Field(
-        ..., description="Search query for memory recall", min_length=1
+        "", description="Search query for memory recall"
     )
     memory_type: str | None = Field(
         None, description="Filter by type: episodic, semantic, procedural"
@@ -116,6 +119,9 @@ class MemoryRecallInput(BaseModel):
         None, description="Filter by tags"
     )
     limit: int = Field(10, description="Max results", ge=1, le=50)
+    pinned_only: bool = Field(
+        False, description="If true, return only pinned memories (no search needed)"
+    )
 
 
 class MemoryForgetInput(BaseModel):

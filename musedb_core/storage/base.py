@@ -192,6 +192,7 @@ class StorageBackend(Protocol):
         memory_type: str,
         tags: list[str],
         metadata: dict,
+        pinned: bool = False,
     ) -> dict:
         """Store a memory entry. Returns the memory record dict."""
         ...
@@ -203,11 +204,14 @@ class StorageBackend(Protocol):
         tags: list[str] | None,
         limit: int,
         offset: int,
+        pinned_only: bool = False,
     ) -> dict:
         """FTS search on memories with time-decay scoring.
 
         Returns {total, results[...]} where each result includes a ``score``
         field that combines FTS relevance with recency decay.
+
+        If *pinned_only* is True, skip FTS and return all pinned memories.
         """
         ...
 

@@ -145,6 +145,20 @@ Most agent memory systems (Claude Code, Cursor, etc.) store memories as Markdown
 
 MuseDB's FTS benchmark shows keyword search **improves with scale** while vector/RAG degrades (4.6/5 vs 3.5/5 at 325 docs). The same applies to memory: vector similarity retrieves topically-similar noise, while FTS retrieves exactly what the agent asked for.
 
+### LongMemEval benchmark
+
+We tested MuseDB's memory pipeline against [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (ICLR 2025) — 470 questions across 6 types: single-session extraction, multi-session reasoning, temporal reasoning, knowledge updates, and preference recall.
+
+| | MuseDB (FTS5) | MemPalace (ChromaDB) |
+|---|---|---|
+| **R@5** | **100%** (470/470) | 96.6% |
+| Embedding model | None (keyword index) | all-MiniLM-L6-v2 |
+| API calls | 0 | 0 |
+| Median recall latency | **0.9 ms** | — |
+| Total benchmark time | **32 s** | ~5 min |
+
+All 6 question types score 100%. Reproduce with `python benchmark/longmemeval_bench.py`. See [benchmark/longmemeval_results.json](benchmark/longmemeval_results.json) for per-question details.
+
 ### `musedb_memory_store` — Store a memory
 
 ```
@@ -158,23 +172,33 @@ Three memory types:
 - **episodic** — Past events, task outcomes, interaction history
 - **procedural** — Learned workflows, rules, best practices
 
+**Pinned memories** — Set `pinned=true` for critical facts that should always surface first. Pinned memories get a 10x ranking boost in search results, and can be retrieved instantly without FTS search:
+
+```
+musedb_memory_store(content="User is a senior backend engineer at Acme Corp", pinned=true)
+musedb_memory_recall(pinned_only=true)  # Returns all pinned memories — ideal for agent startup
+```
+
 ### `musedb_memory_recall` — Search memories
 
-Results ranked by **relevance × recency** — recent memories score higher than older ones with the same keyword match.
+Results ranked by **relevance × recency** — recent memories score higher than older ones with the same keyword match. Pinned memories always surface first.
 
 ```
 musedb_memory_recall(query="user preferences")
 → Found 3 memories:
+    📌 [semantic] (score: 8.2340, created: 2025-03-20T10:00:00Z)
+      User is a senior backend engineer at Acme Corp
     [semantic] (score: 0.8234, created: 2025-03-20T10:00:00Z)
       User prefers dark mode and compact layout
     [semantic] (score: 0.3112, created: 2025-01-05T08:00:00Z)
       User prefers verbose error messages
 ```
 
-Filter by type or tags:
+Filter by type, tags, or retrieve only pinned:
 ```
 musedb_memory_recall(query="deploy", memory_type="episodic")
 musedb_memory_recall(query="testing", tags=["ci"])
+musedb_memory_recall(pinned_only=true)   # All pinned memories, no search query needed
 ```
 
 ### `musedb_memory_forget` — Delete memories
@@ -204,7 +228,9 @@ results = await db.search("quarterly revenue")            # full-text search
 
 # Memory
 await db.memory_store("User prefers concise answers", memory_type="semantic")
+await db.memory_store("User is a senior engineer", pinned=True)  # always surfaces first
 memories = await db.memory_recall("user preferences")    # FTS + time-decay
+pinned   = await db.memory_recall("", pinned_only=True)  # agent startup context
 await db.memory_forget(memory_id="abc-123")              # delete by ID
 
 await db.close()
@@ -228,9 +254,9 @@ MuseDB also exposes a full HTTP API. Run with `musedb serve` (embedded) or `dock
 | `/files/{id}` | `GET`/`DELETE` | File details / delete |
 | `/watch` | `GET` | List active watchers |
 | `/watch/{id}` | `GET`/`DELETE` | Watcher details / stop |
-| `/memory` | `POST` | Store a memory (`{"content", "memory_type", "tags", "metadata"}`) |
+| `/memory` | `POST` | Store a memory (`{"content", "memory_type", "pinned", "tags", "metadata"}`) |
 | `/memory` | `GET` | List memories (`?memory_type=`, `?tags=`, `?limit=`, `?offset=`) |
-| `/memory/recall` | `POST` | Search memories with time-decay ranking (`{"query", "memory_type", "tags"}`) |
+| `/memory/recall` | `POST` | Search memories with time-decay ranking (`{"query", "memory_type", "tags", "pinned_only"}`) |
 | `/memory/forget` | `POST` | Delete memories (`{"memory_id"}` or `{"query", "memory_type"}`) |
 | `/health` | `GET` | Health check |
 
@@ -251,7 +277,7 @@ MuseDB also exposes a full HTTP API. Run with `musedb serve` (embedded) or `dock
 
 - **Dual-mode** — Embedded (SQLite, zero-config) or Server (PostgreSQL, shared access); same API
 - **7 MCP tools** — `read`, `search`, `glob`, `info` for files + `memory_store`, `memory_recall`, `memory_forget` for agent memory
-- **Agent memory** — Persistent long-term memory with FTS + time-decay ranking; no vector DB needed
+- **Agent memory** — Persistent long-term memory with FTS + time-decay ranking, pinned memories, 100% on LongMemEval; no vector DB needed
 - **Real-time sync** — Directories are watched via OS-native events after indexing
 - **Full-text search** — FTS5 (SQLite) / tsvector (PostgreSQL) with jieba CJK tokenization
 - **Structured output** — Spreadsheets as `{sheets: [{columns, rows}]}` for direct analysis

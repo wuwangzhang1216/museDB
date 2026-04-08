@@ -212,10 +212,15 @@ class Workspace:
         memory_type: str = "semantic",
         tags: list[str] | None = None,
         metadata: dict | None = None,
+        pinned: bool = False,
     ) -> dict:
-        """Store a memory entry."""
+        """Store a memory entry.
+
+        Set *pinned=True* for critical facts that should always surface
+        first in recall results (similar to MemPalace L0/L1 layers).
+        """
         from musedb_core.services.memory_service import store_memory
-        return await store_memory(content, memory_type, tags, metadata)
+        return await store_memory(content, memory_type, tags, metadata, pinned=pinned)
 
     async def memory_recall(
         self,
@@ -223,10 +228,15 @@ class Workspace:
         memory_type: str | None = None,
         tags: list[str] | None = None,
         limit: int = 10,
+        pinned_only: bool = False,
     ) -> dict:
-        """Search and recall stored memories."""
+        """Search and recall stored memories.
+
+        If *pinned_only=True*, return all pinned memories without FTS search
+        (useful for agent startup / context injection).
+        """
         from musedb_core.services.memory_service import recall_memories
-        return await recall_memories(query, memory_type, tags, limit)
+        return await recall_memories(query, memory_type, tags, limit, pinned_only=pinned_only)
 
     async def memory_forget(
         self,

@@ -14,6 +14,7 @@ async def store_memory(
     memory_type: str = "semantic",
     tags: list[str] | None = None,
     metadata: dict | None = None,
+    pinned: bool = False,
 ) -> dict:
     """Store a new memory entry."""
     if memory_type not in VALID_MEMORY_TYPES:
@@ -31,6 +32,7 @@ async def store_memory(
         memory_type=memory_type,
         tags=tags or [],
         metadata=metadata or {},
+        pinned=pinned,
     )
 
 
@@ -40,8 +42,12 @@ async def recall_memories(
     tags: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
+    pinned_only: bool = False,
 ) -> dict:
-    """Search memories with FTS + time-decay scoring."""
+    """Search memories with FTS + time-decay scoring.
+
+    If *pinned_only* is True, skip FTS and return all pinned memories.
+    """
     if memory_type and memory_type not in VALID_MEMORY_TYPES:
         raise ValueError(f"Invalid memory_type filter: '{memory_type}'")
 
@@ -52,6 +58,7 @@ async def recall_memories(
         tags=tags,
         limit=limit,
         offset=offset,
+        pinned_only=pinned_only,
     )
 
 

@@ -264,10 +264,15 @@ async def musedb_memory_store(params: MemoryStoreInput) -> str:
     - episodic: Past events, interaction outcomes, task results
     - procedural: Learned workflows, rules, patterns
 
+    Set pinned=true for critical facts that should always surface first in recall
+    results (e.g. user identity, project context). Pinned memories get a 10x
+    ranking boost and can be retrieved instantly with pinned_only=true in recall.
+
     Args:
         params (MemoryStoreInput): Validated input parameters containing:
             - content (str): Memory text to store
             - memory_type (str): 'semantic', 'episodic', or 'procedural'
+            - pinned (bool): Pin this memory for priority retrieval (default: false)
             - tags (list[str]): Tags for categorization
             - metadata (dict): Additional key-value metadata
 
@@ -276,14 +281,15 @@ async def musedb_memory_store(params: MemoryStoreInput) -> str:
 
     Examples:
         - Store a fact: content="User prefers dark mode", memory_type="semantic"
+        - Pin a critical fact: content="User is a senior backend engineer", pinned=true
         - Store an event: content="Deployed v2.1 to production on 2025-03-15", memory_type="episodic"
-        - Store a workflow: content="Always run tests before deploying", memory_type="procedural"
     """
     return await musedb.memory_store(
         content=params.content,
         memory_type=params.memory_type,
         tags=params.tags,
         metadata=params.metadata,
+        pinned=params.pinned,
     )
 
 
@@ -323,6 +329,7 @@ async def musedb_memory_recall(params: MemoryRecallInput) -> str:
         memory_type=params.memory_type,
         tags=params.tags,
         limit=params.limit,
+        pinned_only=params.pinned_only,
     )
 
 

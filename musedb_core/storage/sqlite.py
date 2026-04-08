@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS memories (
     memory_id     TEXT NOT NULL UNIQUE,
     content       TEXT NOT NULL,
     memory_type   TEXT NOT NULL DEFAULT 'semantic',
+    pinned        INTEGER NOT NULL DEFAULT 0,
     tags          TEXT NOT NULL DEFAULT '[]',
     metadata      TEXT NOT NULL DEFAULT '{}',
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -134,6 +135,7 @@ class SQLiteBackend:
         self._db.row_factory = aiosqlite.Row
         await self._migrate_fts_if_needed()
         await self._db.executescript(_SCHEMA)
+        await self._migrate_memories_pinned()
         await self._db.commit()
         logger.info("SQLite backend initialised at %s", self._db_path)
 
@@ -175,6 +177,19 @@ class SQLiteBackend:
             logger.info("FTS migration complete — %d pages re-indexed.", len(rows) if rows else 0)
         except Exception:
             # If pages table doesn't exist yet (fresh DB), skip
+            pass
+
+    async def _migrate_memories_pinned(self) -> None:
+        """Add 'pinned' column to memories table if missing (v1.1 migration)."""
+        try:
+            async with self._db.execute("PRAGMA table_info(memories)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "pinned" not in cols and "memory_id" in cols:
+                await self._db.execute(
+                    "ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+                logger.info("Added 'pinned' column to memories table.")
+        except Exception:
             pass
 
     async def close(self) -> None:
@@ -713,6 +728,7 @@ class SQLiteBackend:
         memory_type: str,
         tags: list[str],
         metadata: dict,
+        pinned: bool = False,
     ) -> dict:
         from musedb_core.utils.tokenizer import tokenize_for_fts
 
@@ -721,10 +737,10 @@ class SQLiteBackend:
             try:
                 await self._db.execute(
                     """
-                    INSERT INTO memories (memory_id, content, memory_type, tags, metadata)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO memories (memory_id, content, memory_type, pinned, tags, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (memory_id, content, memory_type, json.dumps(tags), json.dumps(metadata)),
+                    (memory_id, content, memory_type, int(pinned), json.dumps(tags), json.dumps(metadata)),
                 )
                 # Get the autoincrement rowid for FTS
                 async with self._db.execute(
@@ -751,10 +767,15 @@ class SQLiteBackend:
         tags: list[str] | None,
         limit: int,
         offset: int,
+        pinned_only: bool = False,
     ) -> dict:
+        # Fast path: return all pinned memories without FTS search
+        if pinned_only:
+            return await self._list_pinned(memory_type, tags, limit, offset)
+
         from musedb_core.utils.tokenizer import tokenize_for_fts
 
-        fts_query = _escape_fts5(tokenize_for_fts(query))
+        fts_query = _escape_fts5(tokenize_for_fts(query), use_or=True)
 
         conditions: list[str] = []
         params: list = []
@@ -772,8 +793,8 @@ class SQLiteBackend:
         fetch_limit = max(limit * 3, 60)
 
         search_sql = f"""
-            SELECT m.memory_id, m.content, m.memory_type, m.tags, m.metadata,
-                   m.created_at, m.updated_at,
+            SELECT m.memory_id, m.content, m.memory_type, m.pinned,
+                   m.tags, m.metadata, m.created_at, m.updated_at,
                    memories_fts.rank AS fts_rank,
                    julianday('now') - julianday(m.created_at) AS age_days
             FROM memories_fts
@@ -799,16 +820,19 @@ class SQLiteBackend:
         total = total_row[0] if total_row else 0
 
         # Time-decay re-ranking: score = fts_relevance * 0.5^(age_days/30)
+        # Pinned memories get a 10x boost so they surface first.
         scored = []
         for r in rows:
             fts_score = abs(float(r["fts_rank"]))
             age_days = float(r["age_days"]) if r["age_days"] else 0.0
             decay = 0.5 ** (age_days / 30.0)
-            score = round(fts_score * decay, 4)
+            pin_boost = 10.0 if r["pinned"] else 1.0
+            score = round(fts_score * decay * pin_boost, 4)
             scored.append({
                 "memory_id": r["memory_id"],
                 "content": r["content"],
                 "memory_type": r["memory_type"],
+                "pinned": bool(r["pinned"]),
                 "tags": json.loads(r["tags"]) if r["tags"] else [],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                 "highlight": _build_highlight(r["content"], query),
@@ -821,9 +845,58 @@ class SQLiteBackend:
         results = scored[offset : offset + limit]
         return {"total": total, "results": results}
 
+    async def _list_pinned(
+        self,
+        memory_type: str | None,
+        tags: list[str] | None,
+        limit: int,
+        offset: int,
+    ) -> dict:
+        """Return all pinned memories (no FTS search needed)."""
+        conditions = ["m.pinned = 1"]
+        params: list = []
+        if memory_type:
+            conditions.append("m.memory_type = ?")
+            params.append(memory_type)
+        if tags:
+            for tag in tags:
+                conditions.append("m.tags LIKE ?")
+                params.append(f'%"{tag}"%')
+
+        where = " AND ".join(conditions)
+        sql = f"""
+            SELECT m.memory_id, m.content, m.memory_type, m.pinned,
+                   m.tags, m.metadata, m.created_at, m.updated_at
+            FROM memories m
+            WHERE {where}
+            ORDER BY m.created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        count_sql = f"SELECT COUNT(*) FROM memories m WHERE {where}"
+
+        async with self._db.execute(sql, [*params, limit, offset]) as cur:
+            rows = await cur.fetchall()
+        async with self._db.execute(count_sql, params) as cur:
+            total = (await cur.fetchone())[0]
+
+        results = []
+        for r in rows:
+            results.append({
+                "memory_id": r["memory_id"],
+                "content": r["content"],
+                "memory_type": r["memory_type"],
+                "pinned": True,
+                "tags": json.loads(r["tags"]) if r["tags"] else [],
+                "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
+                "score": 1.0,
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+            })
+        return {"total": total, "results": results}
+
     async def get_memory(self, memory_id: str) -> dict | None:
         async with self._db.execute(
-            "SELECT memory_id, content, memory_type, tags, metadata, "
+            "SELECT memory_id, content, memory_type, pinned, tags, metadata, "
             "created_at, updated_at FROM memories WHERE memory_id = ?",
             (memory_id,),
         ) as cur:
@@ -834,6 +907,7 @@ class SQLiteBackend:
             "memory_id": row["memory_id"],
             "content": row["content"],
             "memory_type": row["memory_type"],
+            "pinned": bool(row["pinned"]),
             "tags": json.loads(row["tags"]) if row["tags"] else [],
             "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
             "created_at": row["created_at"],
@@ -878,11 +952,11 @@ class SQLiteBackend:
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
         query = f"""
-            SELECT memory_id, content, memory_type, tags, metadata,
+            SELECT memory_id, content, memory_type, pinned, tags, metadata,
                    created_at, updated_at
             FROM memories
             {where_clause}
-            ORDER BY created_at DESC
+            ORDER BY pinned DESC, created_at DESC
             LIMIT ? OFFSET ?
         """
         count_query = f"SELECT COUNT(*) FROM memories {where_clause}"
@@ -899,6 +973,7 @@ class SQLiteBackend:
                 "memory_id": r["memory_id"],
                 "content": r["content"],
                 "memory_type": r["memory_type"],
+                "pinned": bool(r["pinned"]),
                 "tags": json.loads(r["tags"]) if r["tags"] else [],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                 "created_at": r["created_at"],
@@ -936,9 +1011,50 @@ def _build_highlight(text: str, query: str, context_chars: int = 80) -> str:
     return snippet
 
 
-def _escape_fts5(query: str) -> str:
-    """Minimal FTS5 query escaping — wrap each term to avoid syntax errors."""
-    terms = [t.strip() for t in query.split() if t.strip()]
+_STOPWORDS = frozenset(
+    "a an and are as at be but by do for from had has have he her his how i "
+    "if in is it its just me my no not of on or our she so than that the them "
+    "then there these they this to too up us was we were what when where which "
+    "who why will with would you your".split()
+)
+
+
+def _escape_fts5(query: str, *, use_or: bool = False) -> str:
+    """FTS5 query escaping — wrap each term to avoid syntax errors.
+
+    Args:
+        query: Raw query string.
+        use_or: If True, join terms with OR and add prefix matching
+                (better for natural-language recall queries).
+                If False, use implicit AND (default, better for precise
+                keyword search).
+    """
+    # Strip punctuation that can break FTS5 syntax
+    terms = [t.strip().strip("?!.,;:'\"()[]{}") for t in query.split()]
+    terms = [t.replace('"', '').replace("'", "") for t in terms]
+    terms = [t for t in terms if t]
+    if use_or:
+        # Filter stopwords for OR queries to improve ranking quality
+        filtered = [t for t in terms if t.lower() not in _STOPWORDS]
+        terms = filtered or terms  # fallback to all terms if everything is a stopword
+        # Use prefix matching: "doctors" → "doctors" OR doctor*
+        # This handles plurals and inflected forms without a stemmer.
+        parts = []
+        for t in terms:
+            parts.append(f'"{t}"')
+            # Add prefix form for words long enough (avoids noisy short prefixes).
+            # Only for pure alphanumeric terms — hyphens/special chars break FTS5 prefix syntax.
+            if len(t) >= 4 and t.isalpha():
+                # Strip common English suffixes for a rough stem
+                stem = t
+                for suffix in ("ing", "tion", "sion", "ness", "ment", "able", "ible",
+                               "ous", "ive", "ful", "less", "ers", "ies", "ed", "es", "ly", "s"):
+                    if stem.lower().endswith(suffix) and len(stem) - len(suffix) >= 3:
+                        stem = stem[: -len(suffix)]
+                        break
+                if stem != t:
+                    parts.append(f"{stem}*")
+        return " OR ".join(parts)
     escaped = [f'"{t}"' for t in terms]
     return " ".join(escaped)
 

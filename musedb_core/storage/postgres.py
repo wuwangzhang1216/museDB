@@ -619,6 +619,7 @@ class PostgresBackend:
         memory_type: str,
         tags: list[str],
         metadata: dict,
+        pinned: bool = False,
     ) -> dict:
         import uuid as _uuid
         from musedb_core.database import get_pool
@@ -627,13 +628,14 @@ class PostgresBackend:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO memories (id, content, memory_type, tags, metadata)
-                VALUES ($1, $2, $3, $4, $5::jsonb)
-                RETURNING id, content, memory_type, tags, metadata, created_at, updated_at
+                INSERT INTO memories (id, content, memory_type, pinned, tags, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                RETURNING id, content, memory_type, pinned, tags, metadata, created_at, updated_at
                 """,
                 _uuid.UUID(memory_id),
                 content,
                 memory_type,
+                pinned,
                 tags,
                 json.dumps(metadata),
             )
@@ -646,10 +648,40 @@ class PostgresBackend:
         tags: list[str] | None,
         limit: int,
         offset: int,
+        pinned_only: bool = False,
     ) -> dict:
         from musedb_core.database import get_pool
 
         pool = await get_pool()
+
+        # Fast path: pinned-only retrieval without FTS
+        if pinned_only:
+            async with pool.acquire() as conn:
+                conditions = ["m.pinned = true"]
+                params: list = []
+                idx = 0
+                if memory_type:
+                    idx += 1
+                    conditions.append(f"m.memory_type = ${idx}")
+                    params.append(memory_type)
+                if tags:
+                    idx += 1
+                    conditions.append(f"m.tags @> ${idx}::text[]")
+                    params.append(tags)
+                where = " AND ".join(conditions)
+                n = len(params)
+                rows = await conn.fetch(
+                    f"SELECT m.* FROM memories m WHERE {where} "
+                    f"ORDER BY m.created_at DESC LIMIT ${n+1} OFFSET ${n+2}",
+                    *params, limit, offset,
+                )
+                total = await conn.fetchval(
+                    f"SELECT COUNT(*) FROM memories m WHERE {where}", *params
+                )
+            return {"total": total or 0, "results": [
+                {**_pg_memory_row(r), "score": 1.0} for r in rows
+            ]}
+
         async with pool.acquire() as conn:
             conditions = [
                 "to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)"
@@ -669,15 +701,17 @@ class PostgresBackend:
             where_clause = " AND ".join(conditions)
             n = len(params)
 
+            # Pinned memories get a 10x boost so they surface first
             search_sql = f"""
-                SELECT m.id, m.content, m.memory_type, m.tags, m.metadata,
+                SELECT m.id, m.content, m.memory_type, m.pinned, m.tags, m.metadata,
                        m.created_at, m.updated_at,
                        ts_rank_cd(to_tsvector('english', m.content),
                                   plainto_tsquery('english', $1)) AS fts_score,
                        (ts_rank_cd(to_tsvector('english', m.content),
                                    plainto_tsquery('english', $1))
                         * power(0.5, EXTRACT(EPOCH FROM (now() - m.created_at))
-                                     / 86400.0 / 30.0)) AS score,
+                                     / 86400.0 / 30.0)
+                        * CASE WHEN m.pinned THEN 10.0 ELSE 1.0 END) AS score,
                        ts_headline('english', m.content,
                                    plainto_tsquery('english', $1),
                                    'MaxWords=30, MinWords=10') AS highlight
@@ -699,6 +733,7 @@ class PostgresBackend:
                 "memory_id": str(r["id"]),
                 "content": r["content"],
                 "memory_type": r["memory_type"],
+                "pinned": bool(r.get("pinned", False)),
                 "tags": r["tags"],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                 "highlight": r["highlight"] or "",
@@ -805,6 +840,7 @@ def _pg_memory_row(row) -> dict:
         "memory_id": str(row["id"]),
         "content": row["content"],
         "memory_type": row["memory_type"],
+        "pinned": bool(row.get("pinned", False)),
         "tags": row["tags"],
         "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
         "created_at": row["created_at"].isoformat() + "Z" if row["created_at"] else None,

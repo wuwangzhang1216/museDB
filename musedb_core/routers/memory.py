@@ -22,16 +22,18 @@ router = APIRouter(tags=["memory"])
 class MemoryStoreRequest(BaseModel):
     content: str
     memory_type: str = "semantic"
+    pinned: bool = False
     tags: list[str] = []
     metadata: dict = {}
 
 
 class MemoryRecallRequest(BaseModel):
-    query: str
+    query: str = ""
     memory_type: str | None = None
     tags: list[str] | None = None
     limit: int = 10
     offset: int = 0
+    pinned_only: bool = False
 
 
 class MemoryForgetRequest(BaseModel):
@@ -52,6 +54,7 @@ async def store(request: MemoryStoreRequest):
         memory_type=request.memory_type,
         tags=request.tags,
         metadata=request.metadata,
+        pinned=request.pinned,
     )
 
 
@@ -64,6 +67,7 @@ async def recall(request: MemoryRecallRequest):
         tags=request.tags,
         limit=request.limit,
         offset=request.offset,
+        pinned_only=request.pinned_only,
     )
 
 
