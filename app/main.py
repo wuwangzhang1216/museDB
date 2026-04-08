@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MuseDB",
     description="cat + grep for any file format",
-    version="0.1.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -95,4 +95,4 @@ app.include_router(memory_router)
 
 @app.get("/")
 async def root():
-    return {"service": "musedb", "version": "0.1.0"}
+    return {"service": "musedb", "version": "1.3.0"}
