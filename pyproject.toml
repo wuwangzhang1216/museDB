@@ -1,6 +1,6 @@
 [project]
 name = "musedb"
-version = "1.1.0"
+version = "1.2.0"
 description = "The AI-native file database and memory store. Built for LLM agents to read, search, and remember."
 readme = "README.md"
 requires-python = ">=3.11"
