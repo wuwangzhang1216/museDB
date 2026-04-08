@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # Directory watching
     watch_max_watchers: int = 10
 
+    # Agent memory
+    memory_decay_halflife_days: float = 30.0
+
+    # Authentication (optional — if set, all requests require X-API-Key header)
+    auth_api_key: str = ""
+
     # Storage backend: "postgres" (default, requires PostgreSQL) or "sqlite" (embedded, zero-config)
     backend: str = "postgres"
 

@@ -61,6 +61,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optional API key auth — only active if FILEDB_AUTH_API_KEY is set
+from musedb_core.middleware.auth import ApiKeyMiddleware
+app.add_middleware(ApiKeyMiddleware, api_key=settings.auth_api_key if hasattr(settings, "auth_api_key") else "")
+
 
 @app.exception_handler(FileDBNotFoundError)
 async def file_not_found_handler(request: Request, exc: FileDBNotFoundError):

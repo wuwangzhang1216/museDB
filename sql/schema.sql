@@ -53,12 +53,16 @@ CREATE TABLE pages (
     tsv             TSVECTOR GENERATED ALWAYS AS (
                         to_tsvector('english', text)
                     ) STORED,
+    text_jieba      TEXT,                -- jieba-tokenized text for CJK FTS
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX idx_pages_file ON pages(file_id, page_number);
 CREATE INDEX idx_pages_tsv ON pages USING GIN(tsv);
 CREATE INDEX idx_pages_trgm ON pages USING GIN(text gin_trgm_ops);
+CREATE INDEX idx_pages_jieba ON pages USING GIN(
+    to_tsvector('simple', COALESCE(text_jieba, ''))
+);
 
 -- ============================================================
 -- Auto-update timestamp
@@ -80,6 +84,8 @@ CREATE TABLE memories (
     content         TEXT NOT NULL,
     memory_type     TEXT NOT NULL DEFAULT 'semantic',
                     -- 'episodic' | 'semantic' | 'procedural'
+    pinned          BOOLEAN NOT NULL DEFAULT false,
+    content_jieba   TEXT,                -- jieba-tokenized content for CJK FTS
     tags            TEXT[] DEFAULT '{}',
     metadata        JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT now(),
@@ -91,6 +97,9 @@ CREATE INDEX idx_memories_created ON memories(created_at DESC);
 CREATE INDEX idx_memories_tags ON memories USING GIN(tags);
 CREATE INDEX idx_memories_tsv ON memories USING GIN(
     to_tsvector('english', content)
+);
+CREATE INDEX idx_memories_jieba ON memories USING GIN(
+    to_tsvector('simple', COALESCE(content_jieba, ''))
 );
 
 CREATE TRIGGER memories_updated

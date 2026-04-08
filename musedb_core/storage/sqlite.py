@@ -17,6 +17,13 @@ import json
 import logging
 from pathlib import Path
 
+from musedb_core.storage.shared import (
+    build_highlight,
+    escape_fts5,
+    add_sqlite_filters,
+    sqlite_file_row,
+)
+
 logger = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -510,11 +517,11 @@ class SQLiteBackend:
         from musedb_core.utils.tokenizer import tokenize_for_fts
 
         # Tokenize query (handles CJK via jieba) then escape for FTS5
-        fts_query = _escape_fts5(tokenize_for_fts(query))
+        fts_query = escape_fts5(tokenize_for_fts(query))
 
         conditions = ["f.status = 'ready'"]
         params: list = []
-        _add_sqlite_filters(conditions, params, filters)
+        add_sqlite_filters(conditions, params, filters)
         filter_clause = (" AND " + " AND ".join(conditions[1:])) if len(conditions) > 1 else ""
 
         # Join pages table to get original text for Python-side highlighting
@@ -553,7 +560,7 @@ class SQLiteBackend:
                     "file_id": r["file_id"],
                     "page_number": r["page_number"],
                     "section_title": r["section_title"],
-                    "highlight": _build_highlight(r["text"], query),
+                    "highlight": build_highlight(r["text"], query),
                     "relevance_score": round(abs(float(r["rank"])), 3),
                     "updated_at": r["updated_at"],
                 }
@@ -631,7 +638,7 @@ class SQLiteBackend:
             total_row = await cur.fetchone()
         total = total_row[0] if total_row else 0
 
-        return {"total": total, "files": [_sqlite_file_row(r) for r in rows]}
+        return {"total": total, "files": [sqlite_file_row(r) for r in rows]}
 
     async def get_file_by_id(self, file_id: str) -> dict | None:
         async with self._db.execute(
@@ -775,7 +782,7 @@ class SQLiteBackend:
 
         from musedb_core.utils.tokenizer import tokenize_for_fts
 
-        fts_query = _escape_fts5(tokenize_for_fts(query), use_or=True)
+        fts_query = escape_fts5(tokenize_for_fts(query), use_or=True)
 
         conditions: list[str] = []
         params: list = []
@@ -819,13 +826,16 @@ class SQLiteBackend:
             total_row = await cur.fetchone()
         total = total_row[0] if total_row else 0
 
-        # Time-decay re-ranking: score = fts_relevance * 0.5^(age_days/30)
+        # Time-decay re-ranking: score = fts_relevance * 0.5^(age_days/halflife)
         # Pinned memories get a 10x boost so they surface first.
+        from musedb_core.config import settings
+        halflife = settings.memory_decay_halflife_days
+
         scored = []
         for r in rows:
             fts_score = abs(float(r["fts_rank"]))
             age_days = float(r["age_days"]) if r["age_days"] else 0.0
-            decay = 0.5 ** (age_days / 30.0)
+            decay = 0.5 ** (age_days / halflife)
             pin_boost = 10.0 if r["pinned"] else 1.0
             score = round(fts_score * decay * pin_boost, 4)
             scored.append({
@@ -835,7 +845,7 @@ class SQLiteBackend:
                 "pinned": bool(r["pinned"]),
                 "tags": json.loads(r["tags"]) if r["tags"] else [],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
-                "highlight": _build_highlight(r["content"], query),
+                "highlight": build_highlight(r["content"], query),
                 "score": score,
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
@@ -982,105 +992,3 @@ class SQLiteBackend:
         return {"total": total, "memories": memories}
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _build_highlight(text: str, query: str, context_chars: int = 80) -> str:
-    """Build a highlight snippet from original text by finding query terms."""
-    terms = [t.strip().lower() for t in query.split() if t.strip()]
-    if not terms:
-        return text[:150]
-    # Find the first matching term position
-    text_lower = text.lower()
-    best_pos = -1
-    for term in terms:
-        pos = text_lower.find(term)
-        if pos >= 0 and (best_pos < 0 or pos < best_pos):
-            best_pos = pos
-    if best_pos < 0:
-        return text[:150]
-    start = max(0, best_pos - context_chars)
-    end = min(len(text), best_pos + context_chars)
-    snippet = text[start:end]
-    # Add ellipsis if truncated
-    if start > 0:
-        snippet = "..." + snippet
-    if end < len(text):
-        snippet = snippet + "..."
-    return snippet
-
-
-_STOPWORDS = frozenset(
-    "a an and are as at be but by do for from had has have he her his how i "
-    "if in is it its just me my no not of on or our she so than that the them "
-    "then there these they this to too up us was we were what when where which "
-    "who why will with would you your".split()
-)
-
-
-def _escape_fts5(query: str, *, use_or: bool = False) -> str:
-    """FTS5 query escaping — wrap each term to avoid syntax errors.
-
-    Args:
-        query: Raw query string.
-        use_or: If True, join terms with OR and add prefix matching
-                (better for natural-language recall queries).
-                If False, use implicit AND (default, better for precise
-                keyword search).
-    """
-    # Strip punctuation that can break FTS5 syntax
-    terms = [t.strip().strip("?!.,;:'\"()[]{}") for t in query.split()]
-    terms = [t.replace('"', '').replace("'", "") for t in terms]
-    terms = [t for t in terms if t]
-    if use_or:
-        # Filter stopwords for OR queries to improve ranking quality
-        filtered = [t for t in terms if t.lower() not in _STOPWORDS]
-        terms = filtered or terms  # fallback to all terms if everything is a stopword
-        # Use prefix matching: "doctors" → "doctors" OR doctor*
-        # This handles plurals and inflected forms without a stemmer.
-        parts = []
-        for t in terms:
-            parts.append(f'"{t}"')
-            # Add prefix form for words long enough (avoids noisy short prefixes).
-            # Only for pure alphanumeric terms — hyphens/special chars break FTS5 prefix syntax.
-            if len(t) >= 4 and t.isalpha():
-                # Strip common English suffixes for a rough stem
-                stem = t
-                for suffix in ("ing", "tion", "sion", "ness", "ment", "able", "ible",
-                               "ous", "ive", "ful", "less", "ers", "ies", "ed", "es", "ly", "s"):
-                    if stem.lower().endswith(suffix) and len(stem) - len(suffix) >= 3:
-                        stem = stem[: -len(suffix)]
-                        break
-                if stem != t:
-                    parts.append(f"{stem}*")
-        return " OR ".join(parts)
-    escaped = [f'"{t}"' for t in terms]
-    return " ".join(escaped)
-
-
-def _add_sqlite_filters(conditions: list[str], params: list, filters: dict) -> None:
-    if filters.get("tags"):
-        tag = filters["tags"] if isinstance(filters["tags"], str) else filters["tags"][0]
-        params.append(f"%{tag}%")
-        conditions.append("f.tags LIKE ?")
-
-    if filters.get("mime_type"):
-        params.append(filters["mime_type"])
-        conditions.append("f.mime_type = ?")
-
-
-def _sqlite_file_row(row) -> dict:
-    return {
-        "id": row["id"],
-        "filename": row["filename"],
-        "mime_type": row["mime_type"],
-        "file_size": row["file_size"],
-        "total_pages": row["total_pages"],
-        "total_lines": row["total_lines"],
-        "tags": json.loads(row["tags"]) if row["tags"] else [],
-        "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-        "status": row["status"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }

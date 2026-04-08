@@ -42,12 +42,16 @@ async def describe_image(
         or os.environ.get("OPENROUTER_API_KEY")
         or os.environ.get("MUSE_OPENROUTER_API_KEY")
     )
-    if not key:
-        logger.warning("No OpenRouter API key — cannot describe image %s", file_path)
-        return "(no API key configured for vision model)"
-
     if not file_path.exists():
         return f"(image not found: {file_path})"
+
+    if not key:
+        logger.info(
+            "No OpenRouter API key — falling back to Tesseract OCR for %s. "
+            "Set OPENROUTER_API_KEY or MUSE_OPENROUTER_API_KEY for LLM-based descriptions.",
+            file_path,
+        )
+        return await _tesseract_fallback(file_path)
 
     # Build data URL
     raw = file_path.read_bytes()
@@ -118,3 +122,26 @@ async def _call_api(
                 return f"(vision API error: {e})"
 
     return "(vision API rate limited — try again later)"
+
+
+async def _tesseract_fallback(file_path: Path) -> str:
+    """Extract text from image using Tesseract OCR as a fallback."""
+    try:
+        from PIL import Image
+        import pytesseract
+
+        img = await asyncio.to_thread(Image.open, file_path)
+        text = await asyncio.to_thread(
+            pytesseract.image_to_string, img, lang="eng+chi_sim+chi_tra"
+        )
+        text = text.strip()
+        if text:
+            logger.info("Tesseract OCR extracted %d chars from %s", len(text), file_path.name)
+            return text
+        return "(no text detected by Tesseract OCR)"
+    except ImportError:
+        logger.warning("Tesseract/Pillow not installed — cannot OCR %s", file_path)
+        return "(no API key configured; install pytesseract + Pillow for OCR fallback)"
+    except Exception as e:
+        logger.warning("Tesseract OCR failed for %s: %s", file_path, e)
+        return f"(OCR failed: {e})"

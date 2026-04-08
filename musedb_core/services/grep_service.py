@@ -15,15 +15,21 @@ async def grep_files(
     case_insensitive: bool = False,
     context: int = 0,
     max_results: int = 100,
+    per_file_timeout: float = 5.0,
 ) -> dict:
     """Regex search across files in a directory.
 
     Returns matching lines with file paths, line numbers, and optional context.
+    ``per_file_timeout`` caps how long (seconds) a single file may be read.
     """
     return await asyncio.to_thread(
         _grep_files_sync,
         query, path, glob, case_insensitive, context, max_results,
+        per_file_timeout,
     )
+
+
+_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB — skip files larger than this
 
 
 def _grep_files_sync(
@@ -33,8 +39,12 @@ def _grep_files_sync(
     case_insensitive: bool,
     context: int,
     max_results: int,
+    per_file_timeout: float = 5.0,
 ) -> dict:
     """Synchronous grep implementation, run in a thread."""
+    import signal
+    import time
+
     root = Path(path)
     if not root.is_dir():
         return {"total": 0, "results": [], "error": f"Directory not found: {path}"}
@@ -48,6 +58,7 @@ def _grep_files_sync(
     file_pattern = glob or "**/*"
     results: list[dict] = []
     total = 0
+    timed_out_files: list[str] = []
 
     for file_path in root.glob(file_pattern):
         if not file_path.is_file():
@@ -58,20 +69,33 @@ def _grep_files_sync(
         if _should_skip(rel):
             continue
 
+        # Skip files larger than threshold
         try:
+            if file_path.stat().st_size > _MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+
+        try:
+            deadline = time.monotonic() + per_file_timeout
             text = file_path.read_text(encoding="utf-8", errors="replace")
         except (OSError, PermissionError):
             continue
 
         lines = text.split("\n")
+        file_timed_out = False
         for i, line in enumerate(lines):
+            # Check per-file timeout every 5000 lines
+            if i % 5000 == 0 and time.monotonic() > deadline:
+                timed_out_files.append(rel)
+                file_timed_out = True
+                break
+
             if not pattern.search(line):
                 continue
 
             total += 1
             if len(results) >= max_results:
-                # Early break: stop scanning once we have enough results
-                # and have counted enough to know there are more
                 return {
                     "total": total,
                     "results": results,
@@ -98,6 +122,7 @@ def _grep_files_sync(
         "total": total,
         "results": results,
         "truncated": False,
+        **({"timed_out_files": timed_out_files} if timed_out_files else {}),
     }
 
 

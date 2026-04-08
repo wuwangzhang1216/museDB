@@ -21,7 +21,47 @@ class PostgresBackend:
     """
 
     async def init(self) -> None:
-        pass  # Pool lifecycle owned by app/database.py
+        """Run lightweight schema migrations (add columns if missing)."""
+        await self._migrate_cjk_columns()
+
+    async def _migrate_cjk_columns(self) -> None:
+        """Add jieba tokenization columns and pinned flag if missing."""
+        from app.database import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'pages' AND column_name = 'text_jieba'"
+            )
+            if not exists:
+                await conn.execute("ALTER TABLE pages ADD COLUMN text_jieba TEXT")
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pages_jieba ON pages USING GIN("
+                    "to_tsvector('simple', COALESCE(text_jieba, '')))"
+                )
+                logger.info("Added pages.text_jieba column + GIN index")
+
+            exists = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'memories' AND column_name = 'pinned'"
+            )
+            if not exists:
+                await conn.execute(
+                    "ALTER TABLE memories ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT false"
+                )
+                logger.info("Added memories.pinned column")
+
+            exists = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'memories' AND column_name = 'content_jieba'"
+            )
+            if not exists:
+                await conn.execute("ALTER TABLE memories ADD COLUMN content_jieba TEXT")
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_jieba ON memories USING GIN("
+                    "to_tsvector('simple', COALESCE(content_jieba, '')))"
+                )
+                logger.info("Added memories.content_jieba column + GIN index")
 
     async def close(self) -> None:
         pass  # Pool lifecycle owned by app/database.py
@@ -90,13 +130,15 @@ class PostgresBackend:
                         json.dumps(merged_metadata),
                     )
 
+                    from musedb_core.utils.tokenizer import tokenize_for_fts
                     for i, page in enumerate(parse_result.pages):
                         line_start, line_end = page_line_ranges[i]
                         await conn.execute(
                             """
                             INSERT INTO pages (file_id, page_number, section_title,
-                                               content_type, text, line_start, line_end)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                               content_type, text, line_start, line_end,
+                                               text_jieba)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                             """,
                             file_uuid,
                             page.page_number,
@@ -105,6 +147,7 @@ class PostgresBackend:
                             page.text,
                             line_start,
                             line_end,
+                            tokenize_for_fts(page.text),
                         )
 
                     await conn.execute(
@@ -317,88 +360,76 @@ class PostgresBackend:
     async def search_fts(
         self, query: str, filters: dict, limit: int, offset: int
     ) -> dict:
+        from musedb_core.utils.tokenizer import _CJK_RE, tokenize_for_fts
         from app.database import get_pool
+
+        has_cjk = bool(_CJK_RE.search(query))
         pool = await get_pool()
         async with pool.acquire() as conn:
-            conditions = ["p.tsv @@ plainto_tsquery('english', $1)", "f.status = 'ready'"]
-            params: list = [query]
-            _add_pg_filters(conditions, params, filters)
-            where_clause = " AND ".join(conditions)
-            n = len(params)
-            params.extend([limit, offset])
+            if has_cjk:
+                tokenized = tokenize_for_fts(query)
+                conditions = [
+                    "to_tsvector('simple', COALESCE(p.text_jieba, '')) "
+                    "@@ plainto_tsquery('simple', $1)",
+                    "f.status = 'ready'",
+                ]
+                params: list = [tokenized]
+                _add_pg_filters(conditions, params, filters)
+                where_clause = " AND ".join(conditions)
+                n = len(params)
+                params.extend([limit, offset])
 
-            search_sql = f"""
-                SELECT
-                    f.filename, f.id AS file_id, p.page_number, p.section_title,
-                    ts_rank_cd(p.tsv, plainto_tsquery('english', $1)) AS relevance_score,
-                    ts_headline('english', p.text, plainto_tsquery('english', $1),
-                        'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15'
-                    ) AS highlight
-                FROM pages p
-                JOIN files f ON f.id = p.file_id
-                WHERE {where_clause}
-                ORDER BY relevance_score DESC
-                LIMIT ${n + 1} OFFSET ${n + 2}
-            """
+                search_sql = f"""
+                    SELECT
+                        f.filename, f.id AS file_id, p.page_number, p.section_title,
+                        ts_rank_cd(
+                            to_tsvector('simple', COALESCE(p.text_jieba, '')),
+                            plainto_tsquery('simple', $1)
+                        ) AS relevance_score,
+                        ts_headline('simple', COALESCE(p.text_jieba, ''),
+                            plainto_tsquery('simple', $1),
+                            'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15'
+                        ) AS highlight,
+                        f.updated_at
+                    FROM pages p
+                    JOIN files f ON f.id = p.file_id
+                    WHERE {where_clause}
+                    ORDER BY relevance_score DESC
+                    LIMIT ${n + 1} OFFSET ${n + 2}
+                """
+            else:
+                conditions = [
+                    "p.tsv @@ plainto_tsquery('english', $1)",
+                    "f.status = 'ready'",
+                ]
+                params = [query]
+                _add_pg_filters(conditions, params, filters)
+                where_clause = " AND ".join(conditions)
+                n = len(params)
+                params.extend([limit, offset])
+
+                search_sql = f"""
+                    SELECT
+                        f.filename, f.id AS file_id, p.page_number, p.section_title,
+                        ts_rank_cd(p.tsv, plainto_tsquery('english', $1)) AS relevance_score,
+                        ts_headline('english', p.text, plainto_tsquery('english', $1),
+                            'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15'
+                        ) AS highlight,
+                        f.updated_at
+                    FROM pages p
+                    JOIN files f ON f.id = p.file_id
+                    WHERE {where_clause}
+                    ORDER BY relevance_score DESC
+                    LIMIT ${n + 1} OFFSET ${n + 2}
+                """
+
             count_sql = f"""
                 SELECT COUNT(*) FROM pages p JOIN files f ON f.id = p.file_id
                 WHERE {where_clause}
             """
 
             rows = await conn.fetch(search_sql, *params)
-            total = await conn.fetchval(count_sql, *params[: n])
-
-        return {
-            "total": total,
-            "results": [
-                {
-                    "filename": r["filename"],
-                    "file_id": str(r["file_id"]),
-                    "page_number": r["page_number"],
-                    "section_title": r["section_title"],
-                    "highlight": r["highlight"],
-                    "relevance_score": round(float(r["relevance_score"]), 3),
-                }
-                for r in rows
-            ],
-        }
-
-    async def search_cjk(
-        self, query: str, filters: dict, limit: int, offset: int
-    ) -> dict:
-        from app.database import get_pool
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            conditions = ["p.text ILIKE $1", "f.status = 'ready'"]
-            params: list = [f"%{query}%"]
-            _add_pg_filters(conditions, params, filters)
-            where_clause = " AND ".join(conditions)
-            n = len(params)
-            # Add raw query for substring extraction ($n+1), then limit/offset
-            search_params = list(params)
-            search_params.insert(1, query)
-            search_params.extend([limit, offset])
-            count_params = params[:]
-            count_params.extend([limit, offset])
-
-            search_sql = f"""
-                SELECT
-                    f.filename, f.id AS file_id, p.page_number, p.section_title,
-                    1.0 AS relevance_score,
-                    substring(p.text FROM position($2 IN p.text) - 50 FOR 150) AS highlight
-                FROM pages p
-                JOIN files f ON f.id = p.file_id
-                WHERE {where_clause}
-                ORDER BY f.created_at DESC, p.page_number
-                LIMIT ${n + 2} OFFSET ${n + 3}
-            """
-            count_sql = f"""
-                SELECT COUNT(*) FROM pages p JOIN files f ON f.id = p.file_id
-                WHERE {where_clause}
-            """
-
-            rows = await conn.fetch(search_sql, *search_params)
-            total = await conn.fetchval(count_sql, *params)
+            total = await conn.fetchval(count_sql, *params[:n])
 
         return {
             "total": total,
@@ -409,7 +440,8 @@ class PostgresBackend:
                     "page_number": r["page_number"],
                     "section_title": r["section_title"],
                     "highlight": r["highlight"] or "",
-                    "relevance_score": 1.0,
+                    "relevance_score": round(float(r["relevance_score"]), 3),
+                    "updated_at": r["updated_at"].isoformat() + "Z" if r.get("updated_at") else None,
                 }
                 for r in rows
             ],
@@ -537,23 +569,28 @@ class PostgresBackend:
         memory_type: str,
         tags: list[str],
         metadata: dict,
+        pinned: bool = False,
     ) -> dict:
         import uuid as _uuid
         from app.database import get_pool
+        from musedb_core.utils.tokenizer import tokenize_for_fts
 
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO memories (id, content, memory_type, tags, metadata)
-                VALUES ($1, $2, $3, $4, $5::jsonb)
-                RETURNING id, content, memory_type, tags, metadata, created_at, updated_at
+                INSERT INTO memories (id, content, memory_type, pinned, tags, metadata,
+                                      content_jieba)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+                RETURNING id, content, memory_type, pinned, tags, metadata, created_at, updated_at
                 """,
                 _uuid.UUID(memory_id),
                 content,
                 memory_type,
+                pinned,
                 tags,
                 json.dumps(metadata),
+                tokenize_for_fts(content),
             )
         return _pg_memory_row(row)
 
@@ -564,15 +601,76 @@ class PostgresBackend:
         tags: list[str] | None,
         limit: int,
         offset: int,
+        pinned_only: bool = False,
     ) -> dict:
         from app.database import get_pool
+        from musedb_core.utils.tokenizer import _CJK_RE, tokenize_for_fts
 
         pool = await get_pool()
+
+        if pinned_only:
+            async with pool.acquire() as conn:
+                conditions = ["m.pinned = true"]
+                params: list = []
+                idx = 0
+                if memory_type:
+                    idx += 1
+                    conditions.append(f"m.memory_type = ${idx}")
+                    params.append(memory_type)
+                if tags:
+                    idx += 1
+                    conditions.append(f"m.tags @> ${idx}::text[]")
+                    params.append(tags)
+                where = " AND ".join(conditions)
+                n = len(params)
+                rows = await conn.fetch(
+                    f"SELECT m.* FROM memories m WHERE {where} "
+                    f"ORDER BY m.created_at DESC LIMIT ${n+1} OFFSET ${n+2}",
+                    *params, limit, offset,
+                )
+                total = await conn.fetchval(
+                    f"SELECT COUNT(*) FROM memories m WHERE {where}", *params
+                )
+            return {"total": total or 0, "results": [
+                {**_pg_memory_row(r), "score": 1.0} for r in rows
+            ]}
+
+        has_cjk = bool(_CJK_RE.search(query))
+        halflife = 30
+
         async with pool.acquire() as conn:
-            conditions = [
-                "to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)"
-            ]
-            params: list = [query]
+            if has_cjk:
+                tokenized = tokenize_for_fts(query)
+                fts_cond = (
+                    "to_tsvector('simple', COALESCE(m.content_jieba, '')) "
+                    "@@ plainto_tsquery('simple', $1)"
+                )
+                rank_expr = (
+                    "ts_rank_cd(to_tsvector('simple', COALESCE(m.content_jieba, '')), "
+                    "plainto_tsquery('simple', $1))"
+                )
+                headline_expr = (
+                    "ts_headline('simple', COALESCE(m.content_jieba, ''), "
+                    "plainto_tsquery('simple', $1), 'MaxWords=30, MinWords=10')"
+                )
+                query_param = tokenized
+            else:
+                fts_cond = (
+                    "to_tsvector('english', m.content) "
+                    "@@ plainto_tsquery('english', $1)"
+                )
+                rank_expr = (
+                    "ts_rank_cd(to_tsvector('english', m.content), "
+                    "plainto_tsquery('english', $1))"
+                )
+                headline_expr = (
+                    "ts_headline('english', m.content, "
+                    "plainto_tsquery('english', $1), 'MaxWords=30, MinWords=10')"
+                )
+                query_param = query
+
+            conditions = [fts_cond]
+            params: list = [query_param]
             idx = 1
 
             if memory_type:
@@ -588,17 +686,14 @@ class PostgresBackend:
             n = len(params)
 
             search_sql = f"""
-                SELECT m.id, m.content, m.memory_type, m.tags, m.metadata,
+                SELECT m.id, m.content, m.memory_type, m.pinned, m.tags, m.metadata,
                        m.created_at, m.updated_at,
-                       ts_rank_cd(to_tsvector('english', m.content),
-                                  plainto_tsquery('english', $1)) AS fts_score,
-                       (ts_rank_cd(to_tsvector('english', m.content),
-                                   plainto_tsquery('english', $1))
+                       {rank_expr} AS fts_score,
+                       ({rank_expr}
                         * power(0.5, EXTRACT(EPOCH FROM (now() - m.created_at))
-                                     / 86400.0 / 30.0)) AS score,
-                       ts_headline('english', m.content,
-                                   plainto_tsquery('english', $1),
-                                   'MaxWords=30, MinWords=10') AS highlight
+                                     / 86400.0 / {halflife:.1f})
+                        * CASE WHEN m.pinned THEN 10.0 ELSE 1.0 END) AS score,
+                       {headline_expr} AS highlight
                 FROM memories m
                 WHERE {where_clause}
                 ORDER BY score DESC
@@ -617,6 +712,7 @@ class PostgresBackend:
                 "memory_id": str(r["id"]),
                 "content": r["content"],
                 "memory_type": r["memory_type"],
+                "pinned": bool(r.get("pinned", False)),
                 "tags": r["tags"],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                 "highlight": r["highlight"] or "",
@@ -700,47 +796,12 @@ class PostgresBackend:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _pg_memory_row(row) -> dict:
-    return {
-        "memory_id": str(row["id"]),
-        "content": row["content"],
-        "memory_type": row["memory_type"],
-        "tags": row["tags"],
-        "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-        "created_at": row["created_at"].isoformat() + "Z" if row["created_at"] else None,
-        "updated_at": row["updated_at"].isoformat() + "Z" if row["updated_at"] else None,
-    }
+# ---------------------------------------------------------------------------
+# Helpers — delegated to musedb_core.storage.shared
+# ---------------------------------------------------------------------------
 
-
-def _add_pg_filters(conditions: list[str], params: list, filters: dict) -> None:
-    if filters.get("tags"):
-        params.append(filters["tags"] if isinstance(filters["tags"], list) else [filters["tags"]])
-        conditions.append(f"f.tags @> ${len(params)}::text[]")
-
-    if filters.get("mime_type"):
-        params.append(filters["mime_type"])
-        conditions.append(f"f.mime_type = ${len(params)}")
-
-    if filters.get("metadata"):
-        params.append(json.dumps(filters["metadata"]))
-        conditions.append(f"f.metadata @> ${len(params)}::jsonb")
-
-    if filters.get("created_after"):
-        params.append(filters["created_after"])
-        conditions.append(f"f.created_at >= ${len(params)}::timestamptz")
-
-
-def _pg_file_row(row) -> dict:
-    return {
-        "id": str(row["id"]),
-        "filename": row["filename"],
-        "mime_type": row["mime_type"],
-        "file_size": row["file_size"],
-        "total_pages": row["total_pages"],
-        "total_lines": row["total_lines"],
-        "tags": row["tags"],
-        "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-        "status": row["status"],
-        "created_at": row["created_at"].isoformat(),
-        "updated_at": row["updated_at"].isoformat(),
-    }
+from musedb_core.storage.shared import (  # noqa: E402
+    add_pg_filters as _add_pg_filters,
+    pg_memory_row as _pg_memory_row,
+    pg_file_row as _pg_file_row,
+)

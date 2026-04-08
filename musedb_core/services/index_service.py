@@ -76,8 +76,14 @@ async def index_directory(
     tags: list[str] | None = None,
     metadata: dict | None = None,
     max_concurrent: int = 8,
+    incremental: bool = True,
 ) -> dict:
-    """Scan and ingest all supported files in a directory."""
+    """Scan and ingest all supported files in a directory.
+
+    When *incremental* is True (default), files whose checksum matches an
+    existing record are skipped.  Files whose source_path already exists but
+    with a **different** checksum are re-ingested (old record deleted first).
+    """
     files = await asyncio.to_thread(
         scan_directory, dir_path, settings.index_exclude_patterns
     )
@@ -118,13 +124,26 @@ async def index_directory(
 
     to_ingest: list[tuple[Path, str]] = []
     results: list[dict] = []
+    updated = 0
 
+    backend = get_backend()
     for path, mime in supported:
         cs = checksum_map[path]
         if cs in existing_checksums:
             results.append({"filename": path.name, "status": "skipped", "reason": "duplicate"})
-        else:
-            to_ingest.append((path, mime))
+            continue
+
+        # Incremental: check if file already indexed under a different checksum
+        if incremental:
+            source = str(path.resolve()).replace("\\", "/")
+            existing_id = await backend.find_by_source_path(source)
+            if existing_id:
+                # Content changed — delete old record and re-ingest
+                await backend.delete_file(existing_id)
+                updated += 1
+                logger.info("Re-indexing changed file: %s", path.name)
+
+        to_ingest.append((path, mime))
 
     ingest_sem = asyncio.Semaphore(max_concurrent)
 
@@ -152,6 +171,7 @@ async def index_directory(
         "path": str(dir_path.resolve()),
         "total_files": len(files),
         "ingested": ingested,
+        "updated": updated,
         "skipped": skipped,
         "failed": failed,
         "unsupported": unsupported,
