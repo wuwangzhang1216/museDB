@@ -13,7 +13,7 @@ router = APIRouter(tags=["glob"])
 _MAX_RESULTS = 500
 
 
-@router.get("/glob")
+@router.get("/glob", response_model=None)
 async def glob_files(
     pattern: str = Query(..., description="Glob pattern, e.g. '**/*.py', 'src/**/*.ts'"),
     path: str | None = Query(None, description="Root directory to search in"),

@@ -17,7 +17,7 @@ from opendb_core.utils.text import format_with_line_numbers
 router = APIRouter(tags=["read"])
 
 
-@router.get("/read/{filename:path}")
+@router.get("/read/{filename:path}", response_model=None)
 async def read_file(
     filename: str,
     pages: str | None = Query(None, description="Page/slide/sheet range: 3, 3-7, 1,3,5, or sheet name"),
