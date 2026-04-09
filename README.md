@@ -187,6 +187,67 @@ await db.close()
 
 </details>
 
+## Build Your Own Agent (No Framework Needed)
+
+You don't need a framework. A while loop, an LLM, and OpenDB — that's a complete agent:
+
+```python
+import json, asyncio
+from anthropic import Anthropic
+from opendb import OpenDB
+
+client = Anthropic()
+db = OpenDB.open("./workspace")
+
+TOOLS = [
+    {"name": "read",   "description": "Read a file",           "input_schema": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}},
+    {"name": "search", "description": "Search across all files","input_schema": {"type": "object", "properties": {"query": {"type": "string"}},    "required": ["query"]}},
+    {"name": "memory", "description": "Store a memory",         "input_schema": {"type": "object", "properties": {"content": {"type": "string"}},  "required": ["content"]}},
+    {"name": "recall", "description": "Recall memories",        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},    "required": ["query"]}},
+]
+
+async def run(task: str):
+    await db.init()
+    await db.index()
+    messages = [{"role": "user", "content": task}]
+
+    while True:
+        resp = client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=4096,
+            system="You have tools to read files, search, and remember things.",
+            tools=TOOLS, messages=messages,
+        )
+
+        # Extract text and tool calls
+        for block in resp.content:
+            if block.type == "text":
+                print(block.text)
+
+        if resp.stop_reason == "end_turn":
+            break
+
+        # Execute tool calls and feed results back
+        tool_results = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                match block.name:
+                    case "read":   result = await db.read(block.input["filename"])
+                    case "search": result = await db.search(block.input["query"])
+                    case "memory": result = await db.memory_store(block.input["content"])
+                    case "recall": result = await db.memory_recall(block.input["query"])
+                tool_results.append({"type": "tool_result", "tool_use_id": block.id,
+                                     "content": json.dumps(result) if isinstance(result, dict) else str(result)})
+
+        messages.append({"role": "assistant", "content": resp.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    await db.close()
+
+asyncio.run(run("Summarize the Q4 report and remember the key metrics"))
+```
+
+That's it. ~40 lines, zero abstractions, full agent capabilities. Swap `Anthropic()` for any LLM client — the pattern is the same.
+
 ## Why OpenDB?
 
 Without OpenDB, agents write inline parsing code for every document:
