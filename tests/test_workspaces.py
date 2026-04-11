@@ -28,6 +28,24 @@ def isolated_state(tmp_path, monkeypatch):
     yield state
 
 
+@pytest.fixture(autouse=True)
+async def _close_backends_after_test():
+    """Ensure no aiosqlite connections (and their threads) are leaked between
+    tests. Without this, the Python process can hang for minutes on exit
+    waiting on leaked aiosqlite worker threads.
+    """
+    yield
+    import opendb_core.storage as storage_mod
+
+    for key in list(storage_mod._backends.keys()):
+        backend = storage_mod._backends.pop(key)
+        try:
+            await backend.close()
+        except Exception:
+            pass
+    storage_mod._active_key = None
+
+
 @pytest.fixture
 def two_workspaces(tmp_path):
     """Create two workspace root directories with distinct content."""
