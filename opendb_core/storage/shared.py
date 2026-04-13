@@ -5,6 +5,7 @@ SQLite and PostgreSQL implementations.
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime, timezone
 
@@ -79,12 +80,68 @@ def has_recency_intent(query: str) -> bool:
     return bool(set(query.lower().split()) & _RECENCY_KEYWORDS)
 
 
+# FSRS-4.5 power-law constants (experimentally verified on millions of reviews).
+# R(t, S) = (1 + FACTOR * t / S) ^ (-DECAY)
+# FACTOR = 19/81 ensures R(S, S) = 0.9 (90% retention at stability point).
+# DECAY = 0.5 is the FSRS-4.5 default exponent.
+# See: https://github.com/open-spaced-repetition/fsrs4anki/wiki/The-Algorithm
+_FSRS_FACTOR = 19.0 / 81.0  # ≈ 0.2346
+_FSRS_DECAY = 0.5
+
+
+def compute_confidence(
+    base_confidence: float,
+    days_since_last_access: float,
+    access_count: int,
+    pinned: bool,
+    stability: float = 30.0,
+) -> float:
+    """FSRS-inspired power-law decay with recall reinforcement.
+
+    Uses FSRS-4.5's retrievability formula — a power law that decays more
+    gradually than exponential, matching empirical forgetting curve data
+    from millions of Anki reviews.
+
+    Formula::
+
+        S_eff = stability × (1 + 0.5 × ln(1 + access_count))
+        R     = (1 + 19/81 × t / S_eff) ^ (-0.5)
+
+    The 19/81 factor guarantees R = 0.9 when t = S (90% retention at the
+    stability point).  Each recall grows effective stability logarithmically
+    (diminishing returns, following FSRS's SInc pattern).
+
+    Args:
+        base_confidence: Stored confidence value (0.0–1.0), reset to 1.0
+            on each recall.
+        days_since_last_access: Days since last recall hit (or since creation).
+        access_count: Number of times recalled.
+        pinned: Pinned memories are immune to decay.
+        stability: Base stability in days — the time for confidence to
+            drop from 1.0 to 0.9 with zero recalls (default 30 days).
+
+    References:
+        - FSRS-4.5 retrievability: R(t,S) = (1 + 19/81 × t/S)^(-0.5)
+        - https://github.com/open-spaced-repetition/fsrs4anki/wiki/The-Algorithm
+        - YourMemory MCP server (agent-adapted Ebbinghaus decay)
+    """
+    if pinned or days_since_last_access <= 0:
+        return base_confidence
+    # Effective stability grows with each recall (SInc-inspired).
+    # ln(1 + count) gives diminishing returns: 1st recall matters most.
+    s_eff = stability * (1.0 + 0.5 * math.log(1.0 + access_count))
+    # FSRS-4.5 power-law retrievability
+    retrievability = (1.0 + _FSRS_FACTOR * days_since_last_access / s_eff) ** (-_FSRS_DECAY)
+    return base_confidence * retrievability
+
+
 def compute_temporal_score(
     fts_score: float,
     age_days_from_db: float,
     metadata: dict,
     halflife: float,
     pinned: bool,
+    confidence: float = 1.0,
     recency_intent: bool = False,
 ) -> tuple[float, float]:
     """Compute time-decay score, preferring metadata["date"] when available.
@@ -109,7 +166,7 @@ def compute_temporal_score(
     effective_halflife = halflife / 2.0 if recency_intent else halflife
     decay = 0.5 ** (age_days / effective_halflife)
     pin_boost = 10.0 if pinned else 1.0
-    return fts_score * decay * pin_boost, age_days
+    return fts_score * decay * pin_boost * confidence, age_days
 
 
 def escape_fts5(query: str, *, use_or: bool = False) -> str:
@@ -169,6 +226,9 @@ def pg_memory_row(row) -> dict:
         "content": row["content"],
         "memory_type": row["memory_type"],
         "pinned": bool(row.get("pinned", False)),
+        "source": row.get("source", "unknown"),
+        "superseded_id": str(row["superseded_id"]) if row.get("superseded_id") else None,
+        "confidence": float(row["confidence"]) if row.get("confidence") is not None else 1.0,
         "tags": row["tags"],
         "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
         "created_at": row["created_at"].isoformat() + "Z" if row["created_at"] else None,

@@ -292,6 +292,7 @@ async def opendb_memory_store(params: MemoryStoreInput) -> str:
         tags=params.tags,
         metadata=params.metadata,
         pinned=params.pinned,
+        source=params.source,
     )
 
 

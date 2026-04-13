@@ -23,6 +23,7 @@ class MemoryStoreRequest(BaseModel):
     content: str
     memory_type: str = "semantic"
     pinned: bool = False
+    source: str = "unknown"
     tags: list[str] = []
     metadata: dict = {}
 
@@ -55,12 +56,13 @@ async def store(request: MemoryStoreRequest) -> dict:
         tags=request.tags,
         metadata=request.metadata,
         pinned=request.pinned,
+        source=request.source,
     )
 
 
 @router.post("/memory/recall")
 async def recall(request: MemoryRecallRequest) -> dict:
-    """Search and recall stored memories."""
+    """Search and recall stored memories with confidence-based filtering."""
     return await recall_memories(
         query=request.query,
         memory_type=request.memory_type,

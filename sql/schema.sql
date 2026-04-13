@@ -85,6 +85,13 @@ CREATE TABLE memories (
     memory_type     TEXT NOT NULL DEFAULT 'semantic',
                     -- 'episodic' | 'semantic' | 'procedural'
     pinned          BOOLEAN NOT NULL DEFAULT false,
+    source          TEXT NOT NULL DEFAULT 'unknown',
+                    -- 'user_explicit' | 'ai_inference' | 'tool_extraction' | 'unknown'
+    superseded_id   UUID DEFAULT NULL,
+    confidence      DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    last_accessed   TIMESTAMPTZ DEFAULT NULL,
+    access_count    INTEGER NOT NULL DEFAULT 0,
+    workspace_id    TEXT NOT NULL DEFAULT '_default',
     content_jieba   TEXT,                -- jieba-tokenized content for CJK FTS
     tags            TEXT[] DEFAULT '{}',
     metadata        JSONB DEFAULT '{}',
@@ -95,6 +102,8 @@ CREATE TABLE memories (
 CREATE INDEX idx_memories_type ON memories(memory_type);
 CREATE INDEX idx_memories_created ON memories(created_at DESC);
 CREATE INDEX idx_memories_tags ON memories USING GIN(tags);
+CREATE INDEX idx_memories_workspace ON memories(workspace_id);
+CREATE INDEX idx_memories_confidence ON memories(confidence) WHERE confidence >= 0.3;
 CREATE INDEX idx_memories_tsv ON memories USING GIN(
     to_tsvector('english', content)
 );

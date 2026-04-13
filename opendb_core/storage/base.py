@@ -193,6 +193,7 @@ class StorageBackend(Protocol):
         tags: list[str],
         metadata: dict,
         pinned: bool = False,
+        source: str = "unknown",
     ) -> dict:
         """Store a memory entry. Returns the memory record dict."""
         ...

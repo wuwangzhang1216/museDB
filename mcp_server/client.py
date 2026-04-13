@@ -251,6 +251,8 @@ async def memory_store(
     memory_type: str = "semantic",
     tags: list[str] | None = None,
     metadata: dict | None = None,
+    pinned: bool = False,
+    source: str = "unknown",
 ) -> str:
     """Call POST /memory to store a memory."""
     client = await get_client()
@@ -259,6 +261,10 @@ async def memory_store(
         body["tags"] = tags
     if metadata:
         body["metadata"] = metadata
+    if pinned:
+        body["pinned"] = pinned
+    if source != "unknown":
+        body["source"] = source
 
     response = await client.post("/memory", json=body)
     if response.status_code != 200:

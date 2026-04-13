@@ -7,6 +7,7 @@ import uuid
 from opendb_core.storage import get_backend
 
 VALID_MEMORY_TYPES = {"episodic", "semantic", "procedural"}
+VALID_SOURCES = {"user_explicit", "ai_inference", "tool_extraction", "unknown"}
 
 
 async def store_memory(
@@ -15,6 +16,7 @@ async def store_memory(
     tags: list[str] | None = None,
     metadata: dict | None = None,
     pinned: bool = False,
+    source: str = "unknown",
 ) -> dict:
     """Store a new memory entry."""
     if memory_type not in VALID_MEMORY_TYPES:
@@ -24,6 +26,11 @@ async def store_memory(
         )
     if not content or not content.strip():
         raise ValueError("Memory content cannot be empty")
+    if source not in VALID_SOURCES:
+        raise ValueError(
+            f"Invalid source '{source}'. "
+            f"Must be one of: {', '.join(sorted(VALID_SOURCES))}"
+        )
 
     backend = get_backend()
     return await backend.store_memory(
@@ -33,6 +40,7 @@ async def store_memory(
         tags=tags or [],
         metadata=metadata or {},
         pinned=pinned,
+        source=source,
     )
 
 
@@ -44,7 +52,7 @@ async def recall_memories(
     offset: int = 0,
     pinned_only: bool = False,
 ) -> dict:
-    """Search memories with FTS + time-decay scoring.
+    """Search memories with FTS + time-decay + confidence scoring.
 
     If *pinned_only* is True, skip FTS and return all pinned memories.
     """

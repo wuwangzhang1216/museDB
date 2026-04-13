@@ -9,6 +9,7 @@ import json
 import logging
 
 from opendb_core.storage.shared import (
+    compute_confidence,
     compute_temporal_score,
     content_token_set,
     has_recency_intent,
@@ -23,6 +24,8 @@ class PgMemoryMixin:
 
     All methods acquire their own connection from the pool via
     ``opendb_core.database.get_pool()``.
+
+    Expects ``self.workspace_id`` (str) to be set by the host class.
     """
 
     async def _find_conflicting_memory_pg(
@@ -31,20 +34,22 @@ class PgMemoryMixin:
         content: str,
         memory_type: str,
         threshold: float = 0.3,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         """Find an existing PG memory that overlaps significantly.
 
-        Returns the UUID string of the best match, or None.
+        Returns (UUID string, UUID string) of the best match, or (None, None).
+        Pinned and low-confidence memories are excluded from conflict candidates.
         """
         new_tokens = content_token_set(content)
         if len(new_tokens) < 2:
-            return None
+            return None, None
 
         rows = await conn.fetch(
             "SELECT id, content FROM memories "
-            "WHERE memory_type = $1 "
+            "WHERE memory_type = $1 AND workspace_id = $2 "
+            "AND pinned = false AND confidence >= 0.3 "
             "ORDER BY updated_at DESC LIMIT 20",
-            memory_type,
+            memory_type, self.workspace_id,
         )
 
         best_id: str | None = None
@@ -55,7 +60,8 @@ class PgMemoryMixin:
             if sim >= threshold and sim > best_sim:
                 best_sim = sim
                 best_id = str(r["id"])
-        return best_id
+
+        return best_id, best_id
 
     async def store_memory(
         self,
@@ -66,6 +72,7 @@ class PgMemoryMixin:
         tags: list[str],
         metadata: dict,
         pinned: bool = False,
+        source: str = "unknown",
     ) -> dict:
         import uuid as _uuid
         from opendb_core.database import get_pool
@@ -74,11 +81,9 @@ class PgMemoryMixin:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Skip conflict detection for episodic memories — they are event
-            # records that should never overwrite each other.
             conflict_id = None
             if memory_type != "episodic":
-                conflict_id = await self._find_conflicting_memory_pg(
+                conflict_id, _ = await self._find_conflicting_memory_pg(
                     conn, content, memory_type,
                 )
 
@@ -87,27 +92,49 @@ class PgMemoryMixin:
                     """
                     UPDATE memories
                     SET content = $1, pinned = $2, tags = $3, metadata = $4::jsonb,
-                        content_jieba = $5, updated_at = now()
-                    WHERE id = $6
-                    RETURNING id, content, memory_type, pinned, tags, metadata,
+                        content_jieba = $5, source = $6,
+                        superseded_id = id,
+                        confidence = 1.0, last_accessed = NULL, access_count = 0,
+                        updated_at = now()
+                    WHERE id = $7
+                    RETURNING id, content, memory_type, pinned, source,
+                              superseded_id, confidence, tags, metadata,
                               created_at, updated_at
                     """,
                     content, pinned, tags, json.dumps(metadata),
-                    tokenize_for_fts(content), _uuid.UUID(conflict_id),
+                    tokenize_for_fts(content), source, _uuid.UUID(conflict_id),
                 )
             else:
                 row = await conn.fetchrow(
                     """
-                    INSERT INTO memories (id, content, memory_type, pinned, tags, metadata,
-                                          content_jieba)
-                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
-                    RETURNING id, content, memory_type, pinned, tags, metadata,
+                    INSERT INTO memories (id, content, memory_type, pinned, source,
+                                          tags, metadata, content_jieba, workspace_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+                    RETURNING id, content, memory_type, pinned, source,
+                              superseded_id, confidence, tags, metadata,
                               created_at, updated_at
                     """,
-                    _uuid.UUID(memory_id), content, memory_type, pinned, tags,
-                    json.dumps(metadata), tokenize_for_fts(content),
+                    _uuid.UUID(memory_id), content, memory_type, pinned, source,
+                    tags, json.dumps(metadata), tokenize_for_fts(content),
+                    self.workspace_id,
                 )
         return _pg_memory_row(row)
+
+    async def _reinforce_memories_pg(self, conn, memory_ids: list[str]) -> None:
+        """Bump confidence/access_count for recalled memories."""
+        if not memory_ids:
+            return
+        import uuid as _uuid
+        try:
+            uuids = [_uuid.UUID(mid) for mid in memory_ids]
+            await conn.execute(
+                "UPDATE memories SET confidence = 1.0, "
+                "last_accessed = now(), access_count = access_count + 1 "
+                "WHERE id = ANY($1::uuid[])",
+                uuids,
+            )
+        except Exception:
+            pass  # Best-effort
 
     async def recall_memories(
         self,
@@ -126,9 +153,12 @@ class PgMemoryMixin:
         # Fast path: pinned-only retrieval without FTS
         if pinned_only:
             async with pool.acquire() as conn:
-                conditions = ["m.pinned = true"]
-                params: list = []
-                idx = 0
+                conditions = [
+                    "m.pinned = true",
+                    "m.workspace_id = $1",
+                ]
+                params: list = [self.workspace_id]
+                idx = 1
                 if memory_type:
                     idx += 1
                     conditions.append(f"m.memory_type = ${idx}")
@@ -156,6 +186,8 @@ class PgMemoryMixin:
 
         has_cjk = bool(_CJK_RE.search(query))
         halflife = settings.memory_decay_halflife_days
+        stability = settings.memory_stability_days
+        threshold = settings.memory_confidence_threshold
 
         async with pool.acquire() as conn:
             if has_cjk:
@@ -188,9 +220,9 @@ class PgMemoryMixin:
                 )
                 query_param = query
 
-            conditions = [fts_cond]
-            params: list = [query_param]
-            idx = 1
+            conditions = [fts_cond, "m.workspace_id = $2"]
+            params: list = [query_param, self.workspace_id]
+            idx = 2
 
             if memory_type:
                 idx += 1
@@ -204,14 +236,15 @@ class PgMemoryMixin:
             where_clause = " AND ".join(conditions)
             n = len(params)
 
-            # Fetch extra rows for Python-side temporal re-ranking
             fetch_limit = max(limit * 3, 60)
 
             search_sql = f"""
-                SELECT m.id, m.content, m.memory_type, m.pinned, m.tags, m.metadata,
-                       m.created_at, m.updated_at,
+                SELECT m.id, m.content, m.memory_type, m.pinned, m.source,
+                       m.superseded_id, m.confidence, m.last_accessed, m.access_count,
+                       m.tags, m.metadata, m.created_at, m.updated_at,
                        {rank_expr} AS fts_score,
                        EXTRACT(EPOCH FROM (now() - m.updated_at)) / 86400.0 AS age_days,
+                       EXTRACT(EPOCH FROM (now() - COALESCE(m.last_accessed, m.created_at))) / 86400.0 AS days_since_access,
                        {headline_expr} AS highlight
                 FROM memories m
                 WHERE {where_clause}
@@ -231,15 +264,32 @@ class PgMemoryMixin:
             fts_score = float(r["fts_score"]) if r["fts_score"] else 0.0
             db_age = float(r["age_days"]) if r["age_days"] else 0.0
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            days_since = float(r["days_since_access"]) if r["days_since_access"] else 0.0
+
+            live_conf = compute_confidence(
+                base_confidence=float(r["confidence"]),
+                days_since_last_access=days_since,
+                access_count=int(r["access_count"]),
+                pinned=bool(r.get("pinned", False)),
+                stability=stability,
+            )
+
+            if live_conf < threshold:
+                continue
+
             score, eff_age = compute_temporal_score(
                 fts_score, db_age, meta, halflife,
-                pinned=bool(r.get("pinned", False)), recency_intent=recency,
+                pinned=bool(r.get("pinned", False)), confidence=live_conf,
+                recency_intent=recency,
             )
             scored.append({
                 "memory_id": str(r["id"]),
                 "content": r["content"],
                 "memory_type": r["memory_type"],
                 "pinned": bool(r.get("pinned", False)),
+                "source": r.get("source", "unknown"),
+                "superseded_id": str(r["superseded_id"]) if r.get("superseded_id") else None,
+                "confidence": round(live_conf, 4),
                 "tags": r["tags"],
                 "metadata": meta,
                 "highlight": r["highlight"] or "",
@@ -263,6 +313,13 @@ class PgMemoryMixin:
             s.pop("_age_days", None)
             s["score"] = round(s["score"], 4)
         results = scored[offset : offset + limit]
+
+        # Recall reinforcement
+        hit_ids = [r["memory_id"] for r in results]
+        if hit_ids:
+            async with pool.acquire() as conn:
+                await self._reinforce_memories_pg(conn, hit_ids)
+
         return {"total": total or 0, "results": results}
 
     async def get_memory(self, memory_id: str) -> dict | None:
@@ -273,9 +330,10 @@ class PgMemoryMixin:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, content, memory_type, tags, metadata, "
-                "created_at, updated_at FROM memories WHERE id = $1",
-                _uuid.UUID(memory_id),
+                "SELECT id, content, memory_type, pinned, source, superseded_id, "
+                "confidence, tags, metadata, created_at, updated_at "
+                "FROM memories WHERE id = $1 AND workspace_id = $2",
+                _uuid.UUID(memory_id), self.workspace_id,
             )
         return _pg_memory_row(row) if row else None
 
@@ -286,7 +344,8 @@ class PgMemoryMixin:
         pool = await get_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM memories WHERE id = $1", _uuid.UUID(memory_id)
+                "DELETE FROM memories WHERE id = $1 AND workspace_id = $2",
+                _uuid.UUID(memory_id), self.workspace_id,
             )
         return result == "DELETE 1"
 
@@ -302,9 +361,9 @@ class PgMemoryMixin:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            conditions: list[str] = []
-            params: list = []
-            idx = 0
+            conditions: list[str] = ["workspace_id = $1"]
+            params: list = [self.workspace_id]
+            idx = 1
 
             if memory_type:
                 idx += 1
@@ -315,15 +374,15 @@ class PgMemoryMixin:
                 conditions.append(f"tags @> ${idx}::text[]")
                 params.append(tags)
 
-            where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            where_clause = "WHERE " + " AND ".join(conditions)
             n = len(params)
 
             query = f"""
-                SELECT id, content, memory_type, tags, metadata,
-                       created_at, updated_at
+                SELECT id, content, memory_type, pinned, source, superseded_id,
+                       confidence, tags, metadata, created_at, updated_at
                 FROM memories
                 {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY pinned DESC, created_at DESC
                 LIMIT ${n + 1} OFFSET ${n + 2}
             """
             count_query = f"SELECT COUNT(*) FROM memories {where_clause}"

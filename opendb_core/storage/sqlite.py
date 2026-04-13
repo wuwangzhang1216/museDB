@@ -95,6 +95,11 @@ CREATE TABLE IF NOT EXISTS memories (
     content       TEXT NOT NULL,
     memory_type   TEXT NOT NULL DEFAULT 'semantic',
     pinned        INTEGER NOT NULL DEFAULT 0,
+    source        TEXT NOT NULL DEFAULT 'unknown',
+    superseded_id TEXT DEFAULT NULL,
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    last_accessed TEXT DEFAULT NULL,
+    access_count  INTEGER NOT NULL DEFAULT 0,
     tags          TEXT NOT NULL DEFAULT '[]',
     metadata      TEXT NOT NULL DEFAULT '{}',
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
@@ -145,6 +150,7 @@ class SQLiteBackend(SQLiteMemoryMixin):
         await self._migrate_fts_if_needed()
         await self._db.executescript(_SCHEMA)
         await self._migrate_memories_pinned()
+        await self._migrate_memories_v2()
         await self._db.commit()
         logger.info("SQLite backend initialised at %s", self._db_path)
 
@@ -198,6 +204,26 @@ class SQLiteBackend(SQLiteMemoryMixin):
                     "ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
                 )
                 logger.info("Added 'pinned' column to memories table.")
+        except (aiosqlite.OperationalError, aiosqlite.DatabaseError):
+            pass
+
+    async def _migrate_memories_v2(self) -> None:
+        """Add provenance + confidence columns (v1.6 migration)."""
+        try:
+            async with self._db.execute("PRAGMA table_info(memories)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            if "memory_id" not in cols:
+                return  # memories table doesn't exist yet
+            for col, ddl in [
+                ("source", "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'"),
+                ("superseded_id", "ALTER TABLE memories ADD COLUMN superseded_id TEXT DEFAULT NULL"),
+                ("confidence", "ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"),
+                ("last_accessed", "ALTER TABLE memories ADD COLUMN last_accessed TEXT DEFAULT NULL"),
+                ("access_count", "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if col not in cols:
+                    await self._db.execute(ddl)
+                    logger.info("Added '%s' column to memories table.", col)
         except (aiosqlite.OperationalError, aiosqlite.DatabaseError):
             pass
 

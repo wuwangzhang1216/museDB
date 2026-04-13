@@ -102,6 +102,10 @@ class MemoryStoreInput(BaseModel):
     metadata: dict = Field(
         default_factory=dict, description="Additional key-value metadata"
     )
+    source: str = Field(
+        "unknown",
+        description="Provenance: 'user_explicit', 'ai_inference', 'tool_extraction', or 'unknown'",
+    )
 
 
 class MemoryRecallInput(BaseModel):

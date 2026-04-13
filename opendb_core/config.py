@@ -30,6 +30,8 @@ class Settings(BaseSettings):
 
     # Agent memory
     memory_decay_halflife_days: float = 30.0  # time-decay half-life for recall scoring
+    memory_stability_days: float = 30.0  # FSRS stability: days for confidence to drop to 0.9
+    memory_confidence_threshold: float = 0.3  # below this, memory fades out of recall
 
     # Authentication (optional — if set, all requests require X-API-Key header)
     auth_api_key: str = ""

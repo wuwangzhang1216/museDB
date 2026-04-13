@@ -12,6 +12,7 @@ import re
 
 from opendb_core.storage.shared import (
     build_highlight,
+    compute_confidence,
     compute_temporal_score,
     content_token_set,
     escape_fts5,
@@ -47,21 +48,19 @@ class SQLiteMemoryMixin:
         content: str,
         memory_type: str,
         threshold: float = 0.4,
-    ) -> int | None:
+    ) -> tuple[int | None, str | None]:
         """Find an existing memory that overlaps significantly with *content*.
 
-        Returns the integer rowid (``memories.id``) of the best match whose
-        Jaccard token similarity >= *threshold*, or ``None``.
+        Returns (integer rowid, memory_id string) of the best match whose
+        Jaccard token similarity >= *threshold*, or (None, None).
 
-        When the new content contains update-signal phrases (e.g. "moved to",
-        "switched to"), the threshold is lowered to catch updates where the
-        old and new values share few tokens (e.g. address changes).
+        Pinned memories and low-confidence memories are excluded.
         """
         from opendb_core.utils.tokenizer import tokenize_for_fts
 
         new_tokens = content_token_set(content)
         if len(new_tokens) < 2:
-            return None
+            return None, None
 
         # Lower threshold when the content explicitly signals an update
         effective_threshold = threshold
@@ -70,13 +69,14 @@ class SQLiteMemoryMixin:
 
         fts_query = escape_fts5(tokenize_for_fts(content), use_or=True)
         if not fts_query.strip():
-            return None
+            return None, None
 
         sql = """
-            SELECT m.id, m.content
+            SELECT m.id, m.memory_id, m.content
             FROM memories_fts
             JOIN memories m ON memories_fts.rowid = m.id
             WHERE memories_fts MATCH ? AND m.memory_type = ?
+                  AND m.pinned = 0 AND m.confidence >= 0.3
             LIMIT 10
         """
         try:
@@ -86,6 +86,7 @@ class SQLiteMemoryMixin:
             rows = []
 
         best_id: int | None = None
+        best_mid: str | None = None
         best_sim = 0.0
         for r in rows:
             old_tokens = content_token_set(r["content"])
@@ -93,15 +94,16 @@ class SQLiteMemoryMixin:
             if sim >= effective_threshold and sim > best_sim:
                 best_sim = sim
                 best_id = r["id"]
+                best_mid = r["memory_id"]
 
         # Fallback for update-signal content with zero FTS overlap:
         # find the most recent same-type memory and check if the new
         # content looks like a replacement (e.g. address change).
         if best_id is None and self._UPDATE_SIGNALS.search(content):
             fallback_sql = """
-                SELECT m.id, m.content
+                SELECT m.id, m.memory_id, m.content
                 FROM memories m
-                WHERE m.memory_type = ?
+                WHERE m.memory_type = ? AND m.pinned = 0 AND m.confidence >= 0.3
                 ORDER BY m.updated_at DESC
                 LIMIT 5
             """
@@ -118,8 +120,9 @@ class SQLiteMemoryMixin:
                 if sim >= 0.05 and sim > best_sim:
                     best_sim = sim
                     best_id = r["id"]
+                    best_mid = r["memory_id"]
 
-        return best_id
+        return best_id, best_mid
 
     # ------------------------------------------------------------------
     # Store
@@ -134,6 +137,7 @@ class SQLiteMemoryMixin:
         tags: list[str],
         metadata: dict,
         pinned: bool = False,
+        source: str = "unknown",
     ) -> dict:
         from opendb_core.utils.tokenizer import tokenize_for_fts
 
@@ -142,22 +146,25 @@ class SQLiteMemoryMixin:
             # Skip for episodic memories — they are event records that should
             # never overwrite each other.
             conflict_id = None
+            superseded_mid = None
             if memory_type != "episodic":
-                conflict_id = await self._find_conflicting_memory(
+                conflict_id, superseded_mid = await self._find_conflicting_memory(
                     content, memory_type, threshold=0.3,
                 )
 
             await self._db.execute("BEGIN")
             try:
                 if conflict_id is not None:
-                    # Supersede: update existing memory instead of inserting duplicate
+                    # Supersede: update existing memory instead of inserting duplicate.
+                    # Record the old memory_id as superseded_id for provenance.
                     await self._db.execute(
                         "UPDATE memories SET content = ?, memory_id = ?, tags = ?, "
-                        "metadata = ?, pinned = ?, "
+                        "metadata = ?, pinned = ?, source = ?, superseded_id = ?, "
+                        "confidence = 1.0, last_accessed = NULL, access_count = 0, "
                         "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
                         "WHERE id = ?",
                         (content, memory_id, json.dumps(tags), json.dumps(metadata),
-                         int(pinned), conflict_id),
+                         int(pinned), source, superseded_mid, conflict_id),
                     )
                     await self._db.execute(
                         "UPDATE memories_fts SET content = ? WHERE rowid = ?",
@@ -167,11 +174,12 @@ class SQLiteMemoryMixin:
                     # Normal insert
                     await self._db.execute(
                         """
-                        INSERT INTO memories (memory_id, content, memory_type, pinned, tags, metadata)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO memories (memory_id, content, memory_type, pinned,
+                                              source, tags, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (memory_id, content, memory_type, int(pinned),
-                         json.dumps(tags), json.dumps(metadata)),
+                         source, json.dumps(tags), json.dumps(metadata)),
                     )
                     async with self._db.execute(
                         "SELECT id FROM memories WHERE memory_id = ?", (memory_id,)
@@ -189,6 +197,32 @@ class SQLiteMemoryMixin:
 
         # Return the stored record
         return await self.get_memory(memory_id)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # Recall reinforcement (fire-and-forget update after recall)
+    # ------------------------------------------------------------------
+
+    async def _reinforce_memories(self, memory_ids: list[str]) -> None:
+        """Bump confidence/access_count for recalled memories."""
+        if not memory_ids:
+            return
+        try:
+            async with self._write_lock:
+                placeholders = ",".join("?" for _ in memory_ids)
+                await self._db.execute(
+                    f"UPDATE memories SET confidence = 1.0, "
+                    f"last_accessed = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
+                    f"access_count = access_count + 1 "
+                    f"WHERE memory_id IN ({placeholders})",
+                    memory_ids,
+                )
+                await self._db.commit()
+        except aiosqlite.DatabaseError:
+            pass  # Best-effort, don't break recall
+
+    # ------------------------------------------------------------------
+    # Recall
+    # ------------------------------------------------------------------
 
     async def recall_memories(
         self,
@@ -219,14 +253,17 @@ class SQLiteMemoryMixin:
 
         filter_clause = (" AND " + " AND ".join(conditions)) if conditions else ""
 
-        # Fetch extra rows for Python-side time-decay re-ranking
+        # Fetch extra rows for Python-side time-decay + confidence re-ranking
         fetch_limit = max(limit * 3, 60)
 
         search_sql = f"""
             SELECT m.memory_id, m.content, m.memory_type, m.pinned,
+                   m.source, m.superseded_id, m.confidence,
+                   m.last_accessed, m.access_count,
                    m.tags, m.metadata, m.created_at, m.updated_at,
                    memories_fts.rank AS fts_rank,
-                   julianday('now') - julianday(m.updated_at) AS age_days
+                   julianday('now') - julianday(m.updated_at) AS age_days,
+                   julianday('now') - julianday(COALESCE(m.last_accessed, m.created_at)) AS days_since_access
             FROM memories_fts
             JOIN memories m ON memories_fts.rowid = m.id
             WHERE memories_fts MATCH ?{filter_clause}
@@ -249,10 +286,10 @@ class SQLiteMemoryMixin:
             total_row = await cur.fetchone()
         total = total_row[0] if total_row else 0
 
-        # Time-decay re-ranking using metadata event dates when available.
-        # Pinned memories get a 10x boost so they surface first.
         from opendb_core.config import settings
         halflife = settings.memory_decay_halflife_days
+        stability = settings.memory_stability_days
+        threshold = settings.memory_confidence_threshold
         recency = has_recency_intent(query)
 
         scored = []
@@ -260,15 +297,34 @@ class SQLiteMemoryMixin:
             fts_score = abs(float(r["fts_rank"]))
             db_age = float(r["age_days"]) if r["age_days"] else 0.0
             meta = json.loads(r["metadata"]) if r["metadata"] else {}
+            days_since = float(r["days_since_access"]) if r["days_since_access"] else 0.0
+
+            # Compute live confidence (may have decayed since last access)
+            live_conf = compute_confidence(
+                base_confidence=float(r["confidence"]),
+                days_since_last_access=days_since,
+                access_count=int(r["access_count"]),
+                pinned=bool(r["pinned"]),
+                stability=stability,
+            )
+
+            # Skip faded memories
+            if live_conf < threshold:
+                continue
+
             score, eff_age = compute_temporal_score(
                 fts_score, db_age, meta, halflife,
-                pinned=bool(r["pinned"]), recency_intent=recency,
+                pinned=bool(r["pinned"]), confidence=live_conf,
+                recency_intent=recency,
             )
             scored.append({
                 "memory_id": r["memory_id"],
                 "content": r["content"],
                 "memory_type": r["memory_type"],
                 "pinned": bool(r["pinned"]),
+                "source": r["source"] if r["source"] else "unknown",
+                "superseded_id": r["superseded_id"],
+                "confidence": round(live_conf, 4),
                 "tags": json.loads(r["tags"]) if r["tags"] else [],
                 "metadata": meta,
                 "highlight": build_highlight(r["content"], query),
@@ -294,6 +350,11 @@ class SQLiteMemoryMixin:
             s.pop("_age_days", None)
             s["score"] = round(s["score"], 4)
         results = scored[offset : offset + limit]
+
+        # Recall reinforcement: bump confidence for returned memories
+        hit_ids = [r["memory_id"] for r in results]
+        await self._reinforce_memories(hit_ids)
+
         return {"total": total, "results": results}
 
     async def _list_pinned(
@@ -317,6 +378,7 @@ class SQLiteMemoryMixin:
         where = " AND ".join(conditions)
         sql = f"""
             SELECT m.memory_id, m.content, m.memory_type, m.pinned,
+                   m.source, m.superseded_id, m.confidence,
                    m.tags, m.metadata, m.created_at, m.updated_at
             FROM memories m
             WHERE {where}
@@ -337,6 +399,9 @@ class SQLiteMemoryMixin:
                 "content": r["content"],
                 "memory_type": r["memory_type"],
                 "pinned": True,
+                "source": r["source"] if r["source"] else "unknown",
+                "superseded_id": r["superseded_id"],
+                "confidence": float(r["confidence"]),
                 "tags": json.loads(r["tags"]) if r["tags"] else [],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                 "score": 1.0,
@@ -347,8 +412,10 @@ class SQLiteMemoryMixin:
 
     async def get_memory(self, memory_id: str) -> dict | None:
         async with self._db.execute(
-            "SELECT memory_id, content, memory_type, pinned, tags, metadata, "
-            "created_at, updated_at FROM memories WHERE memory_id = ?",
+            "SELECT memory_id, content, memory_type, pinned, source, superseded_id, "
+            "confidence, last_accessed, access_count, "
+            "tags, metadata, created_at, updated_at "
+            "FROM memories WHERE memory_id = ?",
             (memory_id,),
         ) as cur:
             row = await cur.fetchone()
@@ -359,6 +426,9 @@ class SQLiteMemoryMixin:
             "content": row["content"],
             "memory_type": row["memory_type"],
             "pinned": bool(row["pinned"]),
+            "source": row["source"] if row["source"] else "unknown",
+            "superseded_id": row["superseded_id"],
+            "confidence": float(row["confidence"]),
             "tags": json.loads(row["tags"]) if row["tags"] else [],
             "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
             "created_at": row["created_at"],
@@ -392,6 +462,7 @@ class SQLiteMemoryMixin:
     ) -> dict:
         conditions: list[str] = []
         params: list = []
+
         if memory_type:
             conditions.append("memory_type = ?")
             params.append(memory_type)
@@ -403,8 +474,8 @@ class SQLiteMemoryMixin:
         where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
         query = f"""
-            SELECT memory_id, content, memory_type, pinned, tags, metadata,
-                   created_at, updated_at
+            SELECT memory_id, content, memory_type, pinned, source, superseded_id,
+                   confidence, tags, metadata, created_at, updated_at
             FROM memories
             {where_clause}
             ORDER BY pinned DESC, created_at DESC
@@ -425,6 +496,9 @@ class SQLiteMemoryMixin:
                 "content": r["content"],
                 "memory_type": r["memory_type"],
                 "pinned": bool(r["pinned"]),
+                "source": r["source"] if r["source"] else "unknown",
+                "superseded_id": r["superseded_id"],
+                "confidence": float(r["confidence"]),
                 "tags": json.loads(r["tags"]) if r["tags"] else [],
                 "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
                 "created_at": r["created_at"],

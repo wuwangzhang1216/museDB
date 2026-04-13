@@ -23,6 +23,9 @@ class PostgresBackend(PgMemoryMixin):
     ``app.database.get_pool()``, which is initialised by ``app/main.py``.
     """
 
+    def __init__(self, *, workspace_id: str = "_default") -> None:
+        self.workspace_id = workspace_id
+
     async def init(self) -> None:
         """Run lightweight schema migrations (add columns if missing)."""
         await self._migrate_cjk_columns()
@@ -71,6 +74,30 @@ class PostgresBackend(PgMemoryMixin):
                     "to_tsvector('simple', COALESCE(content_jieba, '')))"
                 )
                 logger.info("Added memories.content_jieba column + GIN index")
+
+            # v1.6 memory hardening columns
+            for col, ddl in [
+                ("source", "ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'"),
+                ("superseded_id", "ALTER TABLE memories ADD COLUMN superseded_id UUID DEFAULT NULL"),
+                ("confidence", "ALTER TABLE memories ADD COLUMN confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0"),
+                ("last_accessed", "ALTER TABLE memories ADD COLUMN last_accessed TIMESTAMPTZ DEFAULT NULL"),
+                ("access_count", "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"),
+                ("workspace_id", "ALTER TABLE memories ADD COLUMN workspace_id TEXT NOT NULL DEFAULT '_default'"),
+            ]:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'memories' AND column_name = $1", col
+                )
+                if not exists:
+                    await conn.execute(ddl)
+                    logger.info("Added memories.%s column", col)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_confidence "
+                "ON memories(confidence) WHERE confidence >= 0.3"
+            )
 
     # ------------------------------------------------------------------
     # Ingestion

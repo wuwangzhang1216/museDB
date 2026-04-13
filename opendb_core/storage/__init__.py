@@ -64,19 +64,20 @@ async def init_backend(
         _active_key = key
         logger.info("Using SQLite backend at %s", db_path)
     else:
-        key = "postgres"
+        workspace_id = kwargs.get("workspace_id", "_default")
+        key = f"postgres:{workspace_id}"
 
         if key in _backends:
             _active_key = key
-            logger.debug("Reusing existing PostgreSQL backend")
+            logger.debug("Reusing existing PostgreSQL backend for workspace %s", workspace_id)
             return
 
         from opendb_core.storage.postgres import PostgresBackend
-        backend = PostgresBackend()
+        backend = PostgresBackend(workspace_id=workspace_id)
         await backend.init()
         _backends[key] = backend
         _active_key = key
-        logger.info("Using PostgreSQL backend")
+        logger.info("Using PostgreSQL backend for workspace %s", workspace_id)
 
 
 def get_backend(key: str | None = None) -> StorageBackend:

@@ -233,14 +233,20 @@ class Workspace:
         tags: list[str] | None = None,
         metadata: dict | None = None,
         pinned: bool = False,
+        source: str = "unknown",
     ) -> dict:
         """Store a memory entry.
 
         Set *pinned=True* for critical facts that should always surface
         first in recall results (similar to MemPalace L0/L1 layers).
+
+        *source* tracks provenance: ``'user_explicit'``, ``'ai_inference'``,
+        ``'tool_extraction'``, or ``'unknown'``.
         """
         from opendb_core.services.memory_service import store_memory
-        return await store_memory(content, memory_type, tags, metadata, pinned=pinned)
+        return await store_memory(
+            content, memory_type, tags, metadata, pinned=pinned, source=source,
+        )
 
     async def memory_recall(
         self,
